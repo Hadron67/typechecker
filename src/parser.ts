@@ -539,6 +539,18 @@ export class Parser {
                     self.doInOrder(self.nextToken());
                     break;
                 }
+                case TokenKind.EAR: {
+                    const ear = asSourceRange(token);
+                    self.doInOrder(self.nextToken(), self => {
+                        if (self.token.kind === TokenKind.IDENTIFIER) {
+                            self.astStack.push({kind: AstKind.PATTERN, name: {kind: AstKind.IDENTIFIER, name: self.token.text, ...asSourceRange(self.token)}, ...ear});
+                            self.doInOrder(self.nextToken());
+                        } else {
+                            self.astStack.push({kind: AstKind.PATTERN, ...ear});
+                        }
+                    });
+                    break;
+                }
             }
         }
     }
@@ -648,7 +660,7 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
     }
 
     function getGeneratedSymbol(name: string) {
-        const [ret, success] = context.addNewSymbol(generatedSymbol, name) ?? panic();
+        const [ret, success] = context.addNewSymbol(generatedSymbol, name, true) ?? panic();
         if (success) {
             newSymbols.add(ret);
         }
@@ -656,7 +668,7 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
     }
 
     function addSymbol(parent: Symbol, name: AstIdentifier) {
-        const [symbol, success] = context.addNewSymbol(parent, name.name);
+        const [symbol, success] = context.addNewSymbol(parent, name.name, false);
         if (success) {
             newSymbols.add(symbol);
         } else if (!newSymbols.has(symbol)) {
@@ -688,12 +700,42 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
         return null;
     }
 
-    function resolveIdentifier(name: string, fnArgScope: Symbol[]) {
-        for (let i = 0; i < fnArgScope.length; i++) {
-            const symbol = fnArgScope[fnArgScope.length - 1 - i];
-            if (name === context.getSymbolEntry(symbol).name) {
-                return symbol;
+    function collectAndCreatePatternSymbols(expr: Ast) {
+        const todo = [expr];
+        const names: Set<string> = new Set();
+        while (todo.length > 0) {
+            const expr = todo.pop()!;
+            switch (expr.kind) {
+                case AstKind.PATTERN:
+                    if (expr.name !== void 0) {
+                        names.add(expr.name.name);
+                    }
+                    break;
+                case AstKind.CALL:
+                    pushReversed(todo, expr.args);
+                    todo.push(expr.fn);
+                    break;
             }
+        }
+        const ret: Set<Symbol> = new Set();
+        names.forEach(name => {
+            ret.add(getGeneratedSymbol(name));
+        });
+        return ret;
+    }
+
+    function resolveIdentifier(name: string, fnArgScope: Symbol[] | null, patternSymbols: Set<Symbol> | null) {
+        if (fnArgScope !== null) {
+            for (let i = 0; i < fnArgScope.length; i++) {
+                const symbol = fnArgScope[fnArgScope.length - 1 - i];
+                if (name === context.getSymbolEntry(symbol).name) {
+                    return symbol;
+                }
+            }
+        }
+        if (patternSymbols !== null) {
+            const patternSymbol = context.getSymbol(generatedSymbol, name, false);
+            if (patternSymbol !== null && patternSymbols.has(patternSymbol)) return patternSymbol;
         }
         for (let i = 0; i < scopes.length; i++) {
             const scope = scopes[scopes.length - 1 - i];
@@ -711,7 +753,7 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
 
     function resolveSymbol(expr: AstSymbol) {
         const firstName = expr.path[0];
-        let first = resolveIdentifier(firstName.name, []);
+        let first = resolveIdentifier(firstName.name, null, null);
         if (first === null) {
             diagnostics.push({
                 msg: `undefined identifier ${firstName.name}`,
@@ -733,7 +775,7 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
         return first;
     }
 
-    function convertExpression(expr: Ast) {
+    function convertExpression(expr: Ast, patternSymbols: Set<Symbol> | null) {
         const todo: (Ast | ((stack: Expression[]) => void))[] = [expr];
         const stack: Expression[] = [];
         const fnArgScope: Symbol[] = [];
@@ -767,7 +809,7 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
                     break;
                 }
                 case AstKind.IDENTIFIER: {
-                    const symbol = resolveIdentifier(t.name, fnArgScope);
+                    const symbol = resolveIdentifier(t.name, fnArgScope, patternSymbols);
                     if (symbol !== null) {
                         stack.push({kind: ExpressionKind.SYMBOL, symbol, ...asSourceRange(t)});
                     } else {
@@ -857,12 +899,12 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
         }
         if (diagnostics.length > 0) return exprs;
         for (const decl of file.declarations) {
-            const lhsExpr = convertExpression(decl.lhs);
+            const lhsExpr = convertExpression(decl.lhs, null);
             if (lhsExpr === null) {
                 return exprs;
             }
-            const rhsExpr = decl.rhs !== void 0 ? convertExpression(decl.rhs) : null;
-            const type = decl.type !== void 0 ? convertExpression(decl.type) : null;
+            const rhsExpr = decl.rhs !== void 0 ? convertExpression(decl.rhs, collectAndCreatePatternSymbols(decl.lhs)) : null;
+            const type = decl.type !== void 0 ? convertExpression(decl.type, null) : null;
             if (diagnostics.length > 0) return exprs;
             switch (lhsExpr.kind) {
                 case ExpressionKind.SYMBOL: {

@@ -106,6 +106,7 @@ export interface SymbolEntry {
     readonly name: string;
     readonly parent: Symbol | null;
     readonly subSymbols: Map<string, Symbol>;
+    readonly isLocal: boolean;
     info?: VariableInfo;
 }
 
@@ -115,7 +116,7 @@ export class SymbolRegistry {
     private readonly removedSymbols: Symbol[] = [];
 
     defineInternalSymbols() {
-        const typen = this.getSymbolEntry(this.addNewSymbol(null, "typen")[0]);
+        const typen = this.getSymbolEntry(this.addNewSymbol(null, "typen", false)[0]);
         typen.info = {ownValue: {kind: ExpressionKind.UNIVERSE_SUBSCRIPT_TYPE}, downValue: []};
     }
     getSymbolEntry(s: Symbol): SymbolEntry {
@@ -123,6 +124,8 @@ export class SymbolRegistry {
         return this.entriesById[s] ?? panic();
     }
     stringifySymbol(symbol: Symbol) {
+        const entry0 = this.getSymbolEntry(symbol);
+        if (entry0.isLocal) return entry0.name;
         let s: Symbol | null = symbol;
         const path: string[] = [];
         while (s !== null) {
@@ -132,7 +135,7 @@ export class SymbolRegistry {
         }
         return path.join('.');
     }
-    addNewSymbol(parent: Symbol | null, name: string): [Symbol, boolean] {
+    addNewSymbol(parent: Symbol | null, name: string, isLocal: boolean): [Symbol, boolean] {
         const map = parent === null ? this.entriesByName : this.entriesById[parent].subSymbols;
         if (map.has(name)) {
             return [map.get(name)!, false];
@@ -142,6 +145,7 @@ export class SymbolRegistry {
                 parent,
                 name,
                 subSymbols: new Map(),
+                isLocal,
             };
             map.set(name, ret);
             if (parent !== null) {
@@ -154,6 +158,7 @@ export class SymbolRegistry {
                 parent,
                 name,
                 subSymbols: new Map(),
+                isLocal,
             });
             map.set(name, ret);
             if (parent !== null) {
@@ -167,7 +172,7 @@ export class SymbolRegistry {
         if (map.has(name)) {
             return map.get(name)!;
         } else if (create) {
-            return this.addNewSymbol(parent, name)[0];
+            return this.addNewSymbol(parent, name, false)[0];
         } else return null;
     }
     removeSymbol(symbol: Symbol) {
@@ -340,6 +345,7 @@ export class Analyser {
             name: context.getSymbolEntry(symbol).name,
             parent: null,
             subSymbols: new Map(),
+            isLocal: true,
         };
         this.symbolEntryOverride.get(symbol)!.push(ret);
         return ret;
