@@ -1,4 +1,4 @@
-import { FullSourceRange, SourceRange, WithSourceRange } from "./parser";
+import { FullSourceRange, SourceRange, UNKNOWN_SOURCERANGE, WithSourceRange } from "./parser";
 import { assert, copyMap, panic, popReversed, pushReversed } from "./util";
 
 export type Symbol = number & { __marker: Symbol };
@@ -25,9 +25,11 @@ export type Expression =
     | LambdaExpression
     | PatternExpression
     | TypeUniverseExpression
-    | UniverseSubscriptType
+    | LevelTypeExpression
     | PlaceholderExpression
-    | TypeUniverseSubscriptExpression
+    | LevelExpression
+    | LevelSuccExpression
+    | LevelMaxExpression
 ;
 
 export const enum ExpressionKind {
@@ -36,10 +38,17 @@ export const enum ExpressionKind {
     CALL,
     FN_TYPE,
     PATTERN,
-    TYPE_UNIVERSE,
-    UNIVERSE_SUBSCRIPT_TYPE,
-    UNIVERSE_SUBSCRIPT,
     PLACEHOLDER,
+    UNIVERSE,
+    LEVEL_TYPE,
+    LEVEL,
+    LEVEL_SUCC,
+    LEVEL_MAX,
+
+    TYPE_ASSERTION,
+    EQUAL,
+    LESS_THAN,
+    TRANSLATABLE,
 }
 
 export interface SymbolExpression extends SourceRange {
@@ -72,7 +81,7 @@ export interface PatternExpression {
 }
 
 export interface TypeUniverseExpression {
-    readonly kind: ExpressionKind.TYPE_UNIVERSE;
+    readonly kind: ExpressionKind.UNIVERSE;
     readonly subscript: Expression;
 }
 
@@ -80,16 +89,52 @@ export interface PlaceholderExpression {
     readonly kind: ExpressionKind.PLACEHOLDER;
 }
 
-export interface UniverseSubscriptType {
-    readonly kind: ExpressionKind.UNIVERSE_SUBSCRIPT_TYPE;
+export interface LevelTypeExpression {
+    readonly kind: ExpressionKind.LEVEL_TYPE;
 }
 
-export interface TypeUniverseSubscriptExpression {
-    readonly kind: ExpressionKind.UNIVERSE_SUBSCRIPT;
+export interface LevelSuccExpression {
+    readonly kind: ExpressionKind.LEVEL_SUCC;
+    readonly expr: Expression;
+}
+
+export interface LevelMaxExpression {
+    readonly kind: ExpressionKind.LEVEL_MAX;
+    readonly lhs: Expression;
+    readonly rhs: Expression;
+}
+
+export interface LevelExpression {
+    readonly kind: ExpressionKind.LEVEL;
     readonly value: number;
 }
 
-export const UNIVERSE_SUBSCRIPT_TYPE: UniverseSubscriptType = {kind: ExpressionKind.UNIVERSE_SUBSCRIPT_TYPE};
+export interface TypeAssertionExpression {
+    readonly kind: ExpressionKind.TYPE_ASSERTION;
+    readonly expr: Expression;
+    readonly type: Expression;
+}
+
+export interface EqualExpression {
+    readonly kind: ExpressionKind.EQUAL;
+    readonly lhs: Expression;
+    readonly rhs: Expression;
+}
+
+export interface LessThanExpression {
+    readonly kind: ExpressionKind.LESS_THAN;
+    readonly lhs: Expression;
+    readonly rhs: Expression;
+}
+
+export type DisplayExpression =
+    | Expression
+    | TypeAssertionExpression
+    | EqualExpression
+    | LessThanExpression
+    ;
+
+export const LEVEL_TYPE: LevelTypeExpression = {kind: ExpressionKind.LEVEL_TYPE};
 
 export interface ExpressionRule {
     readonly lhs: Expression;
@@ -105,9 +150,11 @@ export interface VariableInfo {
 export interface SymbolEntry {
     readonly name: string;
     readonly parent: Symbol | null;
-    readonly subSymbols: Map<string, Symbol>;
     readonly isLocal: boolean;
-    info?: VariableInfo;
+    subSymbols?: Map<string, Symbol>;
+    type?: Expression;
+    ownValue?: Expression;
+    downValue?: [Expression, Expression][];
 }
 
 export class SymbolRegistry {
@@ -116,60 +163,72 @@ export class SymbolRegistry {
     private readonly removedSymbols: Symbol[] = [];
 
     defineInternalSymbols() {
-        const typen = this.getSymbolEntry(this.addNewSymbol(null, "typen", false)[0]);
-        typen.info = {ownValue: {kind: ExpressionKind.UNIVERSE_SUBSCRIPT_TYPE}, downValue: []};
+        const builtin = this.addNewSymbol(null, "builtin", false)[0];
+        const level = this.addNewSymbol(builtin, "Level", false)[0];
+        this.getSymbolEntry(level).ownValue = {kind: ExpressionKind.LEVEL_TYPE};
+    }
+    getSymbolCount() {
+        return this.entriesById.length;
     }
     getSymbolEntry(s: Symbol): SymbolEntry {
-        assert(s >= 0 && s < this.entriesById.length);
-        return this.entriesById[s] ?? panic();
+        return this.tryGetSymbolEntry(s) ?? panic();
+    }
+    getSymbolName(s: Symbol) {
+        return this.tryGetSymbolEntry(s) ?? `$${s - this.entriesById.length}`;
+    }
+    tryGetSymbolEntry(s: Symbol): SymbolEntry | null {
+        if (s >= 0 && s < this.entriesById.length) {
+            return this.entriesById[s];
+        } else return null;
     }
     stringifySymbol(symbol: Symbol) {
-        const entry0 = this.getSymbolEntry(symbol);
-        if (entry0.isLocal) return entry0.name;
-        let s: Symbol | null = symbol;
-        const path: string[] = [];
-        while (s !== null) {
-            const entry = this.getSymbolEntry(s);
-            path.unshift(entry.name);
-            s = entry.parent;
+        const entry0 = this.tryGetSymbolEntry(symbol);
+        if (entry0 !== null) {
+            if (entry0.isLocal) return entry0.name;
+            let s: Symbol | null = symbol;
+            const path: string[] = [];
+            while (s !== null) {
+                const entry = this.getSymbolEntry(s);
+                path.unshift(entry.name);
+                s = entry.parent;
+            }
+            return path.join('.');
+        } else {
+            return `$${symbol - this.entriesById.length}`;
         }
-        return path.join('.');
+    }
+    private createSymbol(parent: Symbol | null, name: string, isLocal: boolean) {
+        let ret: Symbol;
+        if (this.removedSymbols.length > 0) {
+            ret = this.removedSymbols.pop()! as Symbol;
+            this.entriesById[ret] = {parent, name, isLocal};
+        } else {
+            ret = this.entriesById.length as Symbol;
+            this.entriesById.push({parent, name, isLocal});
+        }
+        if (parent !== null) {
+            const entry = this.entriesById[parent];
+            if (entry.subSymbols === void 0) {
+                entry.subSymbols = new Map();
+            }
+            entry.subSymbols.set(name, ret);
+        } else {
+            this.entriesByName.set(name, ret);
+        }
+        return ret;
     }
     addNewSymbol(parent: Symbol | null, name: string, isLocal: boolean): [Symbol, boolean] {
-        const map = parent === null ? this.entriesByName : this.entriesById[parent].subSymbols;
-        if (map.has(name)) {
+        let map = parent === null ? this.entriesByName : this.entriesById[parent].subSymbols;
+        if (map !== void 0 && map.has(name)) {
             return [map.get(name)!, false];
-        } else if (this.removedSymbols.length > 0) {
-            const ret = this.removedSymbols.pop()! as Symbol;
-            this.entriesById[ret] = {
-                parent,
-                name,
-                subSymbols: new Map(),
-                isLocal,
-            };
-            map.set(name, ret);
-            if (parent !== null) {
-                this.entriesById[parent].subSymbols.set(name, ret);
-            }
-            return [ret, true];
         } else {
-            const ret = this.entriesById.length as Symbol;
-            this.entriesById.push({
-                parent,
-                name,
-                subSymbols: new Map(),
-                isLocal,
-            });
-            map.set(name, ret);
-            if (parent !== null) {
-                this.entriesById[parent].subSymbols.set(name, ret);
-            }
+            const ret = this.createSymbol(parent, name, isLocal);
             return [ret, true];
         }
     }
     getSymbol(parent: Symbol | null, name: string, create: boolean): Symbol | null {
         const map = parent === null ? this.entriesByName : this.entriesById[parent].subSymbols;
-        if (map.has(name)) {
+        if (map !== void 0 && map.has(name)) {
             return map.get(name)!;
         } else if (create) {
             return this.addNewSymbol(parent, name, false)[0];
@@ -179,7 +238,7 @@ export class SymbolRegistry {
         const entry = this.getSymbolEntry(symbol);
         if (entry.parent !== null) {
             const parent = this.getSymbolEntry(entry.parent);
-            parent.subSymbols.delete(entry.name);
+            (parent.subSymbols ?? panic()).delete(entry.name);
         }
         this.removedSymbols.push(symbol);
     }
@@ -190,76 +249,114 @@ export class SymbolRegistry {
         while (stack.length > 0) {
             const s = stack.pop()!;
             const entry = this.getSymbolEntry(s);
-            const type = entry.info?.type;
-            const ownValue = entry.info?.ownValue;
+            const {type, ownValue, downValue} = entry;
             if (type !== void 0) {
                 lines.push(`${this.stringifySymbol(s)}: ${inputForm(this, type)}`);
             }
             if (ownValue !== void 0) {
                 lines.push(`${this.stringifySymbol(s)} = ${inputForm(this, ownValue)}`);
             }
-            const downValue = entry.info?.downValue;
             if (downValue !== void 0) {
                 for (const [lhs, rhs] of downValue) {
                     lines.push(inputForm(this, lhs) + ' := ' + inputForm(this, rhs));
                 }
             }
-            pushReversed(stack, Array.from(entry.subSymbols.values()));
+            if (entry.subSymbols) {
+                pushReversed(stack, Array.from(entry.subSymbols.values()));
+            }
         }
         return lines;
+    }
+}
+export class TempSymbolRegistry {
+    private readonly tempSymbols: SymbolEntry[] = [];
+    constructor(readonly parent: SymbolRegistry) {}
+    getSymbolEntry(s: Symbol) {
+        const count = this.parent.getSymbolCount();
+        if (s < count) {
+            return this.parent.getSymbolEntry(s);
+        } else {
+            return this.tempSymbols[s - count];
+        }
+    }
+    isTempSymbol(s: Symbol) {
+        return s >= this.parent.getSymbolCount();
+    }
+    createTempSymbol(isLocal: boolean, type: Expression | null) {
+        const ret = this.tempSymbols.length + this.parent.getSymbolCount() as Symbol;
+        const entry: SymbolEntry = { name: '', parent: null, isLocal };
+        if (type !== null) {
+            entry.type = type;
+        }
+        this.tempSymbols.push(entry);
+        return ret;
+    }
+    forEachTempSymbol(cb: (s: Symbol, entry: SymbolEntry) => void) {
+        const count = this.parent.getSymbolCount();
+        for (let i = 0, a = this.tempSymbols; i < a.length; i++) {
+            cb(i + count as Symbol, a[i]);
+        }
     }
 }
 
 export function matchPattern(expr: Expression, pattern: Expression) {
     const substitues: Map<Symbol, Expression> = new Map();
-    const todo: [Expression, Expression, Map<Symbol, Symbol>][] = [[pattern, expr, new Map()]];
+    const todo: [Expression, Expression][] = [[pattern, expr]];
     while (todo.length > 0) {
-        const [pattern, expr, symbolMaps] = todo.pop()!;
+        const [pattern, expr] = todo.pop()!;
         switch (pattern.kind) {
             case ExpressionKind.SYMBOL: {
                 if (expr.kind !== ExpressionKind.SYMBOL) return null;
-                const mapped = symbolMaps.has(expr.symbol) ? symbolMaps.get(expr.symbol) : expr.symbol;
-                if (pattern.symbol !== mapped) return null;
+                if (pattern.symbol !== expr.symbol) return null;
                 break;
             }
             case ExpressionKind.PATTERN:
                 if (pattern.variable !== void 0) {
                     const old = substitues.get(pattern.variable);
                     if (old !== void 0) {
-                        todo.push([old, expr, symbolMaps]);
+                        todo.push([old, expr]);
                     } else {
                         substitues.set(pattern.variable, expr);
                     }
                 }
                 break;
             case ExpressionKind.CALL:
-                if (typeof expr !== 'object' || expr.kind !== ExpressionKind.CALL) return null;
+                if (expr.kind !== ExpressionKind.CALL) return null;
                 if (expr.args.length !== pattern.args.length) {
                     return null;
                 }
                 for (let i = 0, a = pattern.args, b = expr.args; i < a.length; i++) {
-                    todo.push([a[a.length - 1 - i], b[b.length - 1 - i], symbolMaps]);
+                    todo.push([a[a.length - 1 - i], b[b.length - 1 - i]]);
                 }
-                todo.push([pattern.fn, expr.fn, symbolMaps]);
+                todo.push([pattern.fn, expr.fn]);
                 break;
             case ExpressionKind.LAMBDA: {
-                if (typeof expr !== 'object' || expr.kind !== ExpressionKind.LAMBDA) return null;
-                todo.push([pattern.body, expr.body, makeSymbolMap(symbolMaps, pattern.arg, expr.arg)]);
+                if (expr.kind !== ExpressionKind.LAMBDA) return null;
+                todo.push([pattern.body, expr.arg !== pattern.arg ? replaceOneSymbol(expr.body, expr.arg, symbolExpression(pattern.arg, null)) : expr.body]);
                 break;
             }
             case ExpressionKind.FN_TYPE:
-                if (typeof expr !== 'object' || expr.kind !== ExpressionKind.FN_TYPE) return null;
+                if (expr.kind !== ExpressionKind.FN_TYPE) return null;
                 todo.push(
-                    [pattern.outputType, expr.outputType, makeSymbolMap(symbolMaps, pattern.arg, expr.arg)],
-                    [pattern.inputType, expr.inputType, symbolMaps],
+                    [pattern.outputType, pattern.arg !== void 0 && expr.arg !== void 0 && pattern.arg !== expr.arg ? replaceOneSymbol(expr.outputType, expr.arg, pattern) : expr.outputType],
+                    [pattern.inputType, expr.inputType],
                 );
                 break;
-            case ExpressionKind.TYPE_UNIVERSE:
-                if (typeof expr !== 'object' || expr.kind !== ExpressionKind.TYPE_UNIVERSE) return null;
-                todo.push([pattern.subscript, expr.subscript, symbolMaps]);
+            case ExpressionKind.UNIVERSE:
+                if (expr.kind !== ExpressionKind.UNIVERSE) return null;
+                todo.push([pattern.subscript, expr.subscript]);
                 break;
-            case ExpressionKind.UNIVERSE_SUBSCRIPT_TYPE:
-                if (typeof expr !== 'object' || expr.kind !== ExpressionKind.UNIVERSE_SUBSCRIPT_TYPE) return null;
+            case ExpressionKind.LEVEL_TYPE:
+                if (expr.kind !== ExpressionKind.LEVEL_TYPE) return null;
+                break;
+            case ExpressionKind.LEVEL_SUCC:
+                if (expr.kind === ExpressionKind.LEVEL_SUCC) {
+                    todo.push([pattern.expr, expr.expr]);
+                } else if (expr.kind === ExpressionKind.LEVEL) {
+                    if (expr.value > 0) {
+                        todo.push([pattern.expr, {kind: ExpressionKind.LEVEL, value: expr.value - 1}]);
+                    } else return null;
+                }
                 break;
             default: panic();
         }
@@ -284,214 +381,351 @@ function makeSymbolMap(map: Map<Symbol, Symbol>, symbol1: Symbol | undefined, sy
     return map;
 }
 
-export function evaluateFunction(context: SymbolRegistry, fn: Expression, arg: Expression) {
-
-}
-
-export const enum DiagnosticKind {
-    NOT_A_TYPE,
-    TYPE_MISSMATCH,
-    UNTYPED_EXPRESSION,
-    FUNCTION_TYPE_EXPECTED,
-}
-
-export type Diagnostic =
-    | DiagnosticNotAType
-    | DiagnosticTypeMissMatch
-    | DiagnosticUntypedExpression
-    | DiagnosticFunctionTypeExpected
-;
-
-export interface DiagnosticNotAType {
-    readonly kind: DiagnosticKind.NOT_A_TYPE;
-    readonly type: Expression;
-}
-
-export interface DiagnosticTypeMissMatch {
-    readonly kind: DiagnosticKind.TYPE_MISSMATCH;
-    readonly expected: Expression;
-    readonly actual: Expression;
-    readonly value: Expression;
-}
-
-export interface DiagnosticUntypedExpression {
-    readonly kind: DiagnosticKind.UNTYPED_EXPRESSION;
-    readonly expr: Expression;
-}
-
-export interface DiagnosticFunctionTypeExpected {
-    readonly kind: DiagnosticKind.FUNCTION_TYPE_EXPECTED;
-    readonly type: Expression;
-}
-
-export class Analyser {
-    private readonly todo: ((self: Analyser, context: SymbolRegistry) => void)[] = [];
-    private readonly stack: [Expression, Expression][] = [];
-    private readonly diagnostics: Diagnostic[] = [];
-    private readonly symbolEntryOverride: Map<Symbol, SymbolEntry[]> = new Map();
-    private iterations = 0;
-    private getSymbolEntry(context: SymbolRegistry, symbol: Symbol) {
-        const r = this.symbolEntryOverride.get(symbol);
-        if (r !== void 0) {
-            assert(r.length > 0);
-            return r[r.length - 1];
-        } else return context.getSymbolEntry(symbol);
+type ExpanderAction = (self: Expander) => void;
+export class Expander {
+    private readonly todo: ExpanderAction[] = [];
+    private readonly stack: Expression[] = [];
+    private changed = false;
+    constructor(private readonly registry: TempSymbolRegistry) {}
+    private doActions(...actions: ExpanderAction[]) {
+        pushReversed(this.todo, actions);
     }
-    private enterScope(context: SymbolRegistry, symbol: Symbol) {
-        if (!this.symbolEntryOverride.has(symbol)) {
-            this.symbolEntryOverride.set(symbol, []);
-        }
-        const ret: SymbolEntry = {
-            name: context.getSymbolEntry(symbol).name,
-            parent: null,
-            subSymbols: new Map(),
-            isLocal: true,
-        };
-        this.symbolEntryOverride.get(symbol)!.push(ret);
-        return ret;
-    }
-    private leaveScope(symbol: Symbol) {
-        const entry = this.symbolEntryOverride.get(symbol)!;
-        entry.pop();
-        if (entry.length === 0) {
-            this.symbolEntryOverride.delete(symbol);
-        }
-    }
-    private addInferedType(symbol: Symbol, type: Expression) {
-        const r = this.symbolEntryOverride.get(symbol);
-        if (r !== void 0) {
-            assert(r.length > 0);
-            const entry = r[r.length - 1];
-            if (entry.info === void 0) {
-                entry.info = {downValue: []};
-            }
-        }
-    }
-    combineTypes(type1: Expression | null, type2: Expression | null) {
-        if (type1 !== null && type2 !== null) {
-            this.todo.push((self, context) => {
-
-            });
-        }
-    }
-    expand(expr: Expression, typeHint: Expression | null) {
-        this.todo.push((self, context) => {
+    private _expand(expr: Expression): ExpanderAction {
+        return self => {
             switch (expr.kind) {
                 case ExpressionKind.SYMBOL: {
-                    const entry = self.getSymbolEntry(context, expr.symbol);
-                    const type = entry.info?.type;
-                    if (type !== void 0) {
-                        this.todo.push(self => {
-                            const [type] = self.stack.pop()!;
-                            if (entry.info?.ownValue !== void 0) {
-                                self.expand(entry.info.ownValue, type);
-                                self.iterations++;
-                            } else {
-                                self.stack.push([expr, type]);
-                            }
-                        });
-                        this.expand(type, null);
-                    } else {
-                        if (typeHint !== null) {
-                            this.addInferedType(expr.symbol, typeHint);
-                        }
-                        if (entry.info?.ownValue !== void 0) {
-                            self.expand(entry.info.ownValue, typeHint);
-                            self.iterations++;
-                        } else {
-                            self.diagnostics.push({kind: DiagnosticKind.UNTYPED_EXPRESSION, expr});
-                        }
-                    }
+                    const entry = self.registry.getSymbolEntry(expr.symbol);
+                    const ownValue = entry.ownValue;
+                    if (ownValue !== void 0) {
+                        self.doActions(self._expand(ownValue));
+                    } else self.stack.push(expr);
                     return;
                 }
-                case ExpressionKind.CALL: self._doCall(context, expr, typeHint);
+                case ExpressionKind.CALL: {
+                    self.doActions(self._expandCall(expr.fn, expr.args));
+                    return;
+                }
+                case ExpressionKind.LAMBDA: {
+                    const arg = expr.arg;
+                    self.doActions(self._expand(expr.body), self => {
+                        if (self.changed) {
+                            self.stack.push({kind: ExpressionKind.LAMBDA, arg, body: self.stack.pop()!});
+                        } else {
+                            self.stack.push(expr);
+                        }
+                    });
+                    return;
+                }
+                case ExpressionKind.FN_TYPE: {
+                    const arg = expr.arg;
+                    self.doActions(self._expand(expr.inputType), self._expand(expr.outputType), self => {
+                        const outputType = self.stack.pop()!;
+                        const inputType = self.stack.pop()!;
+                        self.stack.push({kind: ExpressionKind.FN_TYPE, inputType, outputType, arg});
+                    });
+                    return;
+                }
+                case ExpressionKind.UNIVERSE: {
+                    self.doActions(self._expand(expr.subscript), self => {
+                        self.stack.push({kind: ExpressionKind.UNIVERSE, subscript: self.stack.pop()!});
+                    });
+                    return;
+                }
+                case ExpressionKind.LEVEL_SUCC: {
+                    self.doActions(self._expand(expr.expr), self => {
+                        const expr = self.stack.pop()!;
+                        if (expr.kind === ExpressionKind.LEVEL) {
+                            self.changed = true;
+                            self.stack.push({kind: ExpressionKind.LEVEL, value: expr.value + 1});
+                        } else {
+                            self.stack.push({kind: ExpressionKind.LEVEL_SUCC, expr});
+                        }
+                    });
+                    break;
+                }
+                case ExpressionKind.LEVEL_MAX: {
+                    self.doActions(self._expand(expr.lhs), self._expand(expr.rhs), self => {
+                        const rhs = self.stack.pop()!;
+                        const lhs = self.stack.pop()!;
+                        if (lhs.kind === ExpressionKind.LEVEL && rhs.kind === ExpressionKind.LEVEL) {
+                            self.changed = true;
+                            self.stack.push({kind: ExpressionKind.LEVEL, value: Math.max(lhs.value, rhs.value)});
+                        } else {
+                            self.stack.push({kind: ExpressionKind.LEVEL_MAX, lhs, rhs});
+                        }
+                    });
+                    break;
+                }
+                case ExpressionKind.PATTERN:
+                case ExpressionKind.LEVEL_TYPE:
+                case ExpressionKind.LEVEL:
+                case ExpressionKind.PLACEHOLDER: self.stack.push(expr); return;
                 default: panic();
             }
-        });
+        };
     }
-    private _doCall(context: SymbolRegistry, expr: CallExpression, typeHint: Expression | null) {
-        const arg = expr.args[0];
-        const restArgs = expr.args.slice(1);
-        this.todo.push((self, context) => {
-            const [fn, fnType] = self.stack.pop()!;
-            if (fnType.kind !== ExpressionKind.FN_TYPE) {
-                self.diagnostics.push({
-                    kind: DiagnosticKind.FUNCTION_TYPE_EXPECTED,
-                    type: fnType,
+    private _expandCall(fn: Expression, args: Expression[]): ExpanderAction {
+        return self => {
+            if (args.length === 1) {
+                self.doActions(self._expand(fn), self._expand(args[0]), self => {
+                    const arg = self.stack.pop()!;
+                    const fn = self.stack.pop()!;
+                    let result: Expression;
+                    switch (fn.kind) {
+                        case ExpressionKind.LAMBDA: {
+                            result = replaceOneSymbol(fn, fn.arg, arg);
+                            self.changed = true;
+                            break;
+                        }
+                        case ExpressionKind.CALL: {
+                            result = {kind: ExpressionKind.CALL, fn: fn.fn, args: fn.args.concat([arg])};
+                            break;
+                        }
+                        default: result = {kind: ExpressionKind.CALL, fn, args: [arg]};
+                    }
+                    if (result.kind === ExpressionKind.CALL && result.fn.kind === ExpressionKind.SYMBOL) {
+                        const entry = self.registry.getSymbolEntry(result.fn.symbol);
+                        if (entry.downValue !== void 0) {
+                            for (const [lhs, rhs] of entry.downValue) {
+                                const map = matchPattern(result, lhs);
+                                if (map !== null) {
+                                    self.changed = true;
+                                    result = replaceSymbols(rhs, map);
+                                    self.doActions(self._expand(result));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    self.stack.push(result);
                 });
-                return;
+            } else {
+                const lastArg = args[args.length - 1];
+                self.doActions(self._expandCall(fn, args.slice(-1)), self => {
+                    self._expandCall(self.stack.pop()!, [lastArg]);
+                });
             }
-            self.todo.push((self, context) => {
-                const [arg, argType] = self.stack.pop()!;
-                if (fnType.arg !== void 0) {
-                    const entry = self.enterScope(context, fnType.arg);
-                    entry.info = {ownValue: arg, downValue: []};
-                    self.todo.push((self, context) => {
-                        self.leaveScope(fnType.arg ?? panic());
-                        self._doCall2(context, fn, arg, argType, self.stack.pop()![0], restArgs);
-                    });
-                    self.expand(fnType.outputType, null);
-                } else {
-                    self._doCall2(context, fn, arg, argType, fnType.outputType, restArgs);
-                }
-            });
-            self.expand(arg, fnType.inputType);
-        });
-        this.expand(expr.fn, typeHint !== null ? {kind: ExpressionKind.FN_TYPE, inputType: {kind: ExpressionKind.PLACEHOLDER}, outputType: typeHint} : null);
+        };
     }
-    private _doCall2(context: SymbolRegistry, fn: Expression, arg: Expression, argType: Expression, returnType: Expression, restArgs: Expression[]) {
-        if (fn.kind === ExpressionKind.CALL) {
-            fn = {kind: ExpressionKind.CALL, fn: fn.fn, args: fn.args.concat([arg])};
-        }
-        if (restArgs.length > 0) {
-            this.todo.push((self, context) => {
-
-            });
-        }
-        switch (fn.kind) {
-            case ExpressionKind.LAMBDA: {
-                const entry = this.enterScope(context, fn.arg);
-                entry.info = {type: argType, ownValue: arg, downValue: []};
-                this.expand(fn.body, returnType);
-                break;
-            }
-        }
-    }
-    checkType(value: Expression, type: Expression) {
-        this.todo.push((self, context) => {
-
-        });
-    }
-    iterate(context: SymbolRegistry, maxIterations: number | null) {
-        this.iterations = 0;
+    expand(expr: Expression): [Expression, boolean] {
+        this.changed = false;
+        this.doActions(this._expand(expr));
         while (this.todo.length > 0) {
-            if (this.diagnostics.length > 0 || maxIterations !== null && this.iterations > maxIterations) return;
-            const t = this.todo.pop()!;
-            t(this, context);
+            this.todo.pop()!(this);
+        }
+        assert(this.stack.length === 1);
+        return [this.stack.pop()!, this.changed];
+    }
+}
+
+export function visitExpression(expr: Expression, cb: (expr: Expression) => boolean) {
+    const todo = [expr];
+    while (todo.length > 0) {
+        const t = todo.pop()!;
+        switch (t.kind) {
+            case ExpressionKind.LEVEL:
+            case ExpressionKind.PLACEHOLDER:
+            case ExpressionKind.LEVEL_TYPE:
+            case ExpressionKind.PATTERN:
+            case ExpressionKind.SYMBOL: if (cb(t)) return false; break;
+            case ExpressionKind.CALL:
+                if (cb(t)) return false;
+                pushReversed(todo, t.args);
+                todo.push(t.fn);
+                break;
+            case ExpressionKind.LAMBDA:
+                if (cb(t)) return false;
+                todo.push(t.body);
+                break;
+            case ExpressionKind.UNIVERSE:
+                if (cb(t)) return false;
+                todo.push(t.subscript);
+                break;
+            case ExpressionKind.FN_TYPE:
+                if (cb(t)) return false;
+                todo.push(t.outputType, t.inputType);
+                break;
         }
     }
 }
 
-export function replaceSymbols(expr: Expression, maps: Map<Symbol, Expression>) {
-
+export function symbolExpression(symbol: Symbol, loc: FullSourceRange | null): SymbolExpression {
+    return {kind: ExpressionKind.SYMBOL, symbol, ...(loc ?? UNKNOWN_SOURCERANGE)};
 }
 
-export function mapAll(context: SymbolRegistry, expr: Expression, replacer: (context: SymbolRegistry, expr: Expression) => Expression) {
-    const stack: Expression[] = [];
-    const todo: (Expression | ((stack: Expression[]) => void))[] = [expr];
-    while (todo.length > 0) {
+function stringifySymbolMap(context: SymbolRegistry, map: Map<Symbol, Expression>) {
+    const parts: string[] = [];
+    map.forEach((v, k) => {
+        parts.push(`${context.stringifySymbol(k)} === ${inputForm(context, v)}`);
+    });
+    return `{${parts.join(', ')}}`;
+}
 
+function expandLambdaCalls(expr: Expression): [Expression, boolean] {
+    if (expr.kind === ExpressionKind.CALL && expr.fn.kind === ExpressionKind.LAMBDA) {
+        const maps = new Map<Symbol, Expression>();
+        let argCount = 0;
+        let fn: Expression = expr.fn;
+        while (fn.kind === ExpressionKind.LAMBDA && argCount < expr.args.length) {
+            maps.set(fn.arg, expr.args[argCount]);
+            argCount++;
+            fn = fn.body;
+        }
+        fn = replaceSymbols(fn, maps);
+        if (argCount === expr.args.length) {
+            return [fn, true];
+        } else if (fn.kind === ExpressionKind.CALL) {
+            return [{kind: ExpressionKind.CALL, fn: fn.fn, args: fn.args.concat(expr.args.slice(argCount))}, true];
+        }
+    }
+    return [expr, false];
+}
+
+type ReplacerAction = (self: Replacer) => void;
+
+class Replacer {
+    private readonly maps: Map<Symbol, Expression> = new Map();
+    private readonly todo: ReplacerAction[] = [];
+    private readonly stack: Expression[] = [];
+    private _doActions(...actions: ReplacerAction[]) {
+        pushReversed(this.todo, actions);
+    }
+    private _replace(expr: Expression): ReplacerAction {
+        return self => {
+            switch (expr.kind) {
+                case ExpressionKind.SYMBOL: {
+                    const value = self.maps.get(expr.symbol);
+                    if (value !== void 0) {
+                        self.stack.push(value);
+                    } else {
+                        self.stack.push(expr);
+                    }
+                    break;
+                }
+                case ExpressionKind.FN_TYPE: {
+                    if (expr.arg === void 0 || !self.maps.has(expr.arg)) {
+                        const arg = expr.arg;
+                        self._doActions(this._replace(expr.inputType), self._replace(expr.outputType), self => {
+                            const outputType = self.stack.pop()!;
+                            const inputType = self.stack.pop()!;
+                            self.stack.push({kind: ExpressionKind.FN_TYPE, inputType, outputType, arg});
+                        });
+                    } else {
+                        const arg = expr.arg;
+                        const old = self.maps.get(expr.arg) ?? panic();
+                        self._doActions(self._replace(expr.inputType), self => {
+                            self.maps.delete(arg);
+                        }, self._replace(expr.outputType), self => {
+                            self.maps.set(arg, old);
+                            const outputType = self.stack.pop()!;
+                            const inputType = self.stack.pop()!;
+                            self.stack.push({kind: ExpressionKind.FN_TYPE, inputType, outputType, arg});
+                        });
+                    }
+                    break;
+                }
+                case ExpressionKind.LAMBDA: {
+                    const arg = expr.arg;
+                    if (!self.maps.has(expr.arg)) {
+                        self._doActions(self._replace(expr.body), self => {
+                            self.stack.push({kind: ExpressionKind.LAMBDA, arg, body: self.stack.pop()!});
+                        });
+                    } else {
+                        const old = self.maps.get(arg) ?? panic();
+                        self._doActions(self._replace(expr.body), self => {
+                            self.maps.set(arg, old);
+                            self.stack.push({kind: ExpressionKind.LAMBDA, arg, body: self.stack.pop()!});
+                        });
+                    }
+                    break;
+                }
+                case ExpressionKind.CALL: {
+                    const length = expr.args.length;
+                    self._doActions(self._replace(expr.fn), ...expr.args.map(arg => self._replace(arg)), self => {
+                        const args: Expression[] = [];
+                        popReversed(self.stack, args, length);
+                        const fn = self.stack.pop()!;
+                        self.stack.push({kind: ExpressionKind.CALL, fn, args});
+                    });
+                    break;
+                }
+                case ExpressionKind.UNIVERSE: {
+                    self._doActions(self._replace(expr.subscript), self => {
+                        self.stack.push({kind: ExpressionKind.UNIVERSE, subscript: self.stack.pop()!});
+                    });
+                    break;
+                }
+                default: self.stack.push(expr);
+            }
+        };
+    }
+    private doReplace(expr: Expression) {
+        this._doActions(this._replace(expr));
+        while (this.todo.length > 0) {
+            this.todo.pop()!(this);
+        }
+        assert(this.stack.length === 1);
+        return this.stack.pop()!;
+    }
+    replaceOne(expr: Expression, source: Symbol, replacement: Expression) {
+        this.maps.clear();
+        this.maps.set(source, replacement);
+        return this.doReplace(expr);
+    }
+    replaceMany(expr: Expression, map: Map<Symbol, Expression>) {
+        this.maps.clear();
+        map.forEach((v, k) => this.maps.set(k, v));
+        return this.doReplace(expr);
     }
 }
 
-export function inputForm(context: SymbolRegistry, expr: Expression) {
+export function replaceOneSymbol(expr: Expression, source: Symbol, replacement: Expression) {
+    return new Replacer().replaceOne(expr, source, replacement);
+}
+
+export function replaceSymbols(expr: Expression, map: Map<Symbol, Expression>) {
+    return new Replacer().replaceMany(expr, map);
+}
+
+export function toPlainString(context: SymbolRegistry, str: ExpressionMessage) {
+    let ret = '';
+    for (const s of str) {
+        if (typeof s === 'string') {
+            ret += s;
+        } else ret += inputForm(context, s);
+    }
+    return ret;
+}
+
+export function inputForm(context: SymbolRegistry, expr: DisplayExpression) {
     const stack: string[] = [];
-    const todo: (Expression | ((stack: string[]) => void))[] = [expr];
+    const todo: (DisplayExpression | ((stack: string[]) => void))[] = [expr];
     while (todo.length > 0) {
         const t = todo.pop()!;
         if (typeof t === 'function') {
             t(stack);
         } else switch (t.kind) {
+            case ExpressionKind.EQUAL:
+                todo.push(stack => {
+                    const rhs = stack.pop()!;
+                    const lhs = stack.pop()!;
+                    stack.push(`${lhs} === ${rhs}`);
+                }, t.rhs, t.lhs);
+                break;
+            case ExpressionKind.TYPE_ASSERTION:
+                todo.push(stack => {
+                    const expr = stack.pop()!;
+                    const type = stack.pop()!;
+                    stack.push(`${expr} : ${type}`);
+                }, t.expr, t.type);
+                break;
+            case ExpressionKind.LESS_THAN:
+                todo.push(stack => {
+                    const rhs = stack.pop()!;
+                    const lhs = stack.pop()!;
+                    stack.push(`${lhs} < ${rhs}`);
+                }, t.rhs, t.lhs);
+                break;
             case ExpressionKind.SYMBOL: stack.push(context.stringifySymbol(t.symbol)); break;
             case ExpressionKind.FN_TYPE: {
                 const needsParenth = t.inputType.kind === ExpressionKind.FN_TYPE;
@@ -500,7 +734,7 @@ export function inputForm(context: SymbolRegistry, expr: Expression) {
                     const outputType = stack.pop()!;
                     const inputType = stack.pop()!;
                     if (arg !== void 0) {
-                        const name = context.getSymbolEntry(arg).name;
+                        const name = context.getSymbolName(arg);
                         stack.push(`(${name}: ${inputType}) -> ${outputType}`);
                     } else if (needsParenth) {
                         stack.push(`(${inputType}) -> ${outputType}`);
@@ -512,13 +746,13 @@ export function inputForm(context: SymbolRegistry, expr: Expression) {
                 const arg = t.arg;
                 todo.push(stack => {
                     const body = stack.pop()!;
-                    stack.push(`\\${context.getSymbolEntry(arg).name} ${body}`);
+                    stack.push(`\\${context.getSymbolName(arg)} ${body}`);
                 }, t.body);
                 break;
             }
             case ExpressionKind.PATTERN: {
                 if (t.variable !== void 0) {
-                    stack.push(`?${context.getSymbolEntry(t.variable).name}`);
+                    stack.push(`?${context.getSymbolName(t.variable)}`);
                 } else {
                     stack.push('?');
                 }
@@ -540,17 +774,43 @@ export function inputForm(context: SymbolRegistry, expr: Expression) {
                 stack.push('_');
                 break;
             }
-            case ExpressionKind.TYPE_UNIVERSE: {
+            case ExpressionKind.UNIVERSE: {
                 todo.push(stack => {
                     stack.push(`type(${stack.pop()!})`);
                 }, t.subscript);
                 break;
             }
-            case ExpressionKind.UNIVERSE_SUBSCRIPT_TYPE: stack.push('typen'); break;
-            case ExpressionKind.UNIVERSE_SUBSCRIPT: stack.push(`${t.value.toString()}n`); break;
+            case ExpressionKind.LEVEL_SUCC: {
+                todo.push(stack => {
+                    stack.push(`builting.Level.succ(${stack.pop()!})`);
+                }, t.expr);
+                break;
+            }
+            case ExpressionKind.LEVEL_MAX: {
+                todo.push(stack => {
+                    const rhs = stack.pop()!;
+                    const lhs = stack.pop()!;
+                    stack.push(`builting.Level.succ(${lhs}, ${rhs})`);
+                }, t.rhs, t.lhs);
+                break;
+            }
+            case ExpressionKind.LEVEL_TYPE: stack.push('builtin.Level'); break;
+            case ExpressionKind.LEVEL: stack.push(`${t.value.toString()}l`); break;
             default: panic();
         }
     }
     assert(stack.length === 1);
     return stack[0];
+}
+
+export type ExpressionMessage = (string | DisplayExpression)[];
+
+export interface ExpressionLogger {
+    info(context: SymbolRegistry, msg: () => ExpressionMessage): void;
+}
+
+export class ConsoleLogger implements ExpressionLogger {
+    info(context: SymbolRegistry, msg: () => ExpressionMessage): void {
+        console.log(toPlainString(context, msg()));
+    }
 }
