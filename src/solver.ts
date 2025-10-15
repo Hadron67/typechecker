@@ -1,4 +1,4 @@
-import { Symbol, Expander, Expression, ExpressionKind, ExpressionLogger, ExpressionMessage, LEVEL_TYPE, symbolExpression, SymbolRegistry, TempSymbolRegistry, replaceOneSymbol, replaceSymbols, toPlainString } from "./expression";
+import { Symbol, Expander, Expression, ExpressionKind, ExpressionLogger, ExpressionMessage, LEVEL_TYPE, symbolExpression, SymbolRegistry, TempSymbolRegistry, replaceOneSymbol, replaceSymbols, toPlainString, checkOwnValueCycle } from "./expression";
 import { assert, panic } from "./util";
 
 export const enum DiagnosticKind {
@@ -41,12 +41,19 @@ export interface DiagnosticUnresolvedConstraint {
 
 export interface DiagnosticUninferedVar {
     readonly kind: DiagnosticKind.UNINFERED_VAR;
+    readonly symbols: Symbol[];
 }
 
 export function renderDiagnostic(diagnostic: Diagnostic): ExpressionMessage {
     switch (diagnostic.kind) {
         case DiagnosticKind.UNEQUAL: return ['uneqal expressions ', diagnostic.expr1, ' and ', diagnostic.expr2];
-        case DiagnosticKind.UNINFERED_VAR: return ['cannot infer all variables'];
+        case DiagnosticKind.UNINFERED_VAR: {
+            const s: ExpressionMessage = [];
+            for (const symbol of diagnostic.symbols) {
+                s.push(symbolExpression(symbol, null), ', ');
+            }
+            return ['cannot infer all variables: ', ...s];
+        }
         case DiagnosticKind.UNMET_SUBSCRIPT_CONSTRAINT: return [`unmet subscript constraint: ${diagnostic.smaller} < ${diagnostic.larger}`];
         case DiagnosticKind.UNRESOLVED_CONSTRAINT: return ['unresolved constraint: ', ...dumpConstraint(diagnostic.constraint)];
         case DiagnosticKind.UNTYPED_EXPRESSION: return ['untyped expression ', diagnostic.expr];
@@ -56,13 +63,11 @@ export function renderDiagnostic(diagnostic: Diagnostic): ExpressionMessage {
 export const enum ConstraintKind {
     TYPE,
     EQUAL,
-    SUBSCRIPT,
 }
 
 export type Constraint =
     | TypeConstraint
     | EqualConstraint
-    | UniverseSubscriptConstraint
     ;
 
 export interface TypeConstraint {
@@ -77,22 +82,12 @@ export interface EqualConstraint {
     readonly largerType: Expression;
 }
 
-export interface UniverseSubscriptConstraint {
-    readonly kind: ConstraintKind.SUBSCRIPT;
-    readonly smaller: Expression;
-    readonly larger: Expression;
-    readonly allowEqual: boolean;
-}
-
 export function dumpConstraint(con: Constraint): ExpressionMessage {
     switch (con.kind) {
         case ConstraintKind.TYPE: return [{kind: ExpressionKind.TYPE_ASSERTION, type: con.type, expr: con.expr}];
         case ConstraintKind.EQUAL: return [{kind: ExpressionKind.EQUAL, lhs: con.smallerType, rhs: con.largerType}];
-        case ConstraintKind.SUBSCRIPT: return [{kind: ExpressionKind.LESS_THAN, lhs: con.smaller, rhs: con.larger}];
     }
 }
-
-type ConstraintSolverAction = (self: ConstraintSolver) => void;
 
 export class ConstraintSolver {
     readonly registry: TempSymbolRegistry;
@@ -107,16 +102,22 @@ export class ConstraintSolver {
         const expander = new Expander(this.registry);
         return expander.expand(expr);
     }
-    private setOwnValue(symbol: Symbol, value: Expression) {
-        const entry = this.registry.getSymbolEntry(symbol);
-        assert(entry.ownValue === void 0);
-        entry.ownValue = value;
-        this.affectedSymbols.add(symbol);
-    }
-    private canSetOwnValue(symbol: Symbol) {
+    private trySetOwnValue(symbol: Symbol, value: Expression) {
         const entry = this.registry.getSymbolEntry(symbol);
         if (entry.ownValue !== void 0) return false;
-        return this.registry.isTempSymbol(symbol) || this.unlockedSymbols.has(symbol);
+        if (!this.registry.isTempSymbol(symbol) && !this.unlockedSymbols.has(symbol)) return false;
+        if (!checkOwnValueCycle(symbol, value)) {
+            this.diagnostics.push({kind: DiagnosticKind.UNEQUAL, expr1: symbolExpression(symbol, null), expr2: value});
+            return false;
+        }
+        entry.ownValue = value;
+        if (entry.type !== void 0) {
+            this.addTypeConstraint(value, entry.type);
+        }
+        if (!this.registry.isTempSymbol(symbol)) {
+            this.affectedSymbols.add(symbol);
+        }
+        return true;
     }
     private matchLevelSucc(expr1: Expression, expr2: Expression) {
         if (expr2.kind === ExpressionKind.LEVEL_SUCC && expr1.kind !== ExpressionKind.LEVEL_SUCC) {
@@ -140,27 +141,19 @@ export class ConstraintSolver {
         return false;
     }
     private evaluateEqualConstraint(expr1: Expression, expr2: Expression): boolean {
-        if (expr1.kind === ExpressionKind.SYMBOL) {
-            if (expr2.kind === ExpressionKind.SYMBOL) {
-                if (expr1.symbol === expr2.symbol) return true;
-                if (this.canSetOwnValue(expr1.symbol)) {
-                    this.setOwnValue(expr1.symbol, expr2);
-                    return true;
-                }
-                if (this.canSetOwnValue(expr2.symbol)) {
-                    this.setOwnValue(expr2.symbol, expr1);
-                    return true;
-                }
-            } else if (this.canSetOwnValue(expr1.symbol)) {
-                this.setOwnValue(expr1.symbol, expr2);
-                return true;
-            }
+        if (expr1.kind !== ExpressionKind.SYMBOL && expr2.kind === ExpressionKind.SYMBOL) {
+            const tmp = expr1;
+            expr1 = expr2;
+            expr2 = tmp;
         }
-        if (expr2.kind === ExpressionKind.SYMBOL) {
-            if (this.canSetOwnValue(expr2.symbol)) {
-                this.setOwnValue(expr2.symbol, expr1);
-                return true;
-            }
+        if (expr1.kind === ExpressionKind.SYMBOL && expr2.kind === ExpressionKind.SYMBOL && !this.registry.isTempSymbol(expr1.symbol) && this.registry.isTempSymbol(expr2.symbol)) {
+            const tmp = expr1;
+            expr1 = expr2;
+            expr2 = tmp;
+        }
+        if (expr1.kind === ExpressionKind.SYMBOL) {
+            if (expr2.kind === ExpressionKind.SYMBOL && expr1.symbol === expr2.symbol) return true;
+            if (this.trySetOwnValue(expr1.symbol, expr2)) return true;
         }
         if (expr1.kind === ExpressionKind.LAMBDA && expr2.kind === ExpressionKind.LAMBDA) {
             const arg1 = this.registry.createTempSymbol(true, null);
@@ -203,65 +196,6 @@ export class ConstraintSolver {
         this.addEqualConstraint(expr1, expr2);
         return false;
     }
-    private evaluateTypeUniverseSubscriptConstraint(smaller: Expression, larger: Expression, allowEqual: boolean): boolean {
-        const [smaller2, changed1] = this.expand(smaller);
-        const [larger2, changed2] = this.expand(larger);
-        const changed = changed1 || changed2;
-        smaller = smaller2;
-        larger = larger2;
-        if (smaller.kind === ExpressionKind.LEVEL && larger.kind === ExpressionKind.LEVEL) {
-            if (smaller.value >= larger.value) {
-                this.diagnostics.push({kind: DiagnosticKind.UNMET_SUBSCRIPT_CONSTRAINT, larger: smaller.value, smaller: smaller.value});
-            }
-            return true;
-        }
-        this.addTypeUniverseSubscriptConstraint(smaller, larger, allowEqual);
-        return changed;
-    }
-    private solveUniverseSubcriptConstraints(cons: UniverseSubscriptConstraint[]) {
-        const values = new Map<Symbol, number>();
-        let done = false;
-        while (!done) {
-            done = true;
-            for (const con of cons) {
-                const {smaller, larger, allowEqual} = con;
-                let smallerValue: number;
-                if (smaller.kind === ExpressionKind.LEVEL) {
-                    smallerValue = smaller.value;
-                } else if (smaller.kind === ExpressionKind.SYMBOL) {
-                    if (values.has(smaller.symbol)) {
-                        smallerValue = values.get(smaller.symbol)!;
-                    } else {
-                        smallerValue = 0;
-                        values.set(smaller.symbol, 0);
-                        done = false;
-                    }
-                } else {
-                    this.diagnostics.push({kind: DiagnosticKind.UNRESOLVED_CONSTRAINT, constraint: con});
-                    return;
-                }
-                if (larger.kind === ExpressionKind.SYMBOL) {
-                    const old = values.get(larger.symbol) ?? 0;
-                    if (allowEqual ? old < smallerValue : old <= smallerValue) {
-                        values.set(larger.symbol, allowEqual ? smallerValue : smallerValue + 1);
-                        done = false;
-                    }
-                } else if (larger.kind === ExpressionKind.LEVEL && (allowEqual ? larger.value < smallerValue : larger.value <= smallerValue)) {
-                    this.diagnostics.push({kind: DiagnosticKind.UNMET_SUBSCRIPT_CONSTRAINT, larger: larger.value, smaller: smallerValue});
-                    return;
-                }
-            }
-        }
-        values.forEach((v, k) => {
-            assert(this.canSetOwnValue(k));
-            this.setOwnValue(k, {kind: ExpressionKind.LEVEL, value: v});
-        });
-        this.registry.forEachTempSymbol((s, entry) => {
-            if (entry.type !== void 0 && entry.type.kind === ExpressionKind.LEVEL_TYPE && entry.ownValue === void 0) {
-                entry.ownValue = {kind: ExpressionKind.LEVEL, value: 0};
-            }
-        });
-    }
     private evaluateTypeConstraint(expr: Expression, type: Expression): boolean {
         switch (expr.kind) {
             case ExpressionKind.SYMBOL: {
@@ -272,6 +206,9 @@ export class ConstraintSolver {
                 } else if (this.registry.isTempSymbol(expr.symbol) || this.unlockedSymbols.has(expr.symbol)) {
                     this.affectedSymbols.add(expr.symbol);
                     entry.type = type;
+                    if (entry.ownValue !== void 0) {
+                        this.addTypeConstraint(entry.ownValue, type);
+                    }
                 } else {
                     this.diagnostics.push({
                         kind: DiagnosticKind.UNTYPED_EXPRESSION,
@@ -283,7 +220,7 @@ export class ConstraintSolver {
             case ExpressionKind.CALL: {
                 const inputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
                 this.addTypeTypeConstraint(inputType);
-                const argSymbol = this.registry.createTempSymbol(true, null);
+                const argSymbol = this.registry.createTempSymbol(true, inputType);
                 const fn: Expression = expr.args.length === 1 ? expr.fn : {kind: ExpressionKind.CALL, fn: expr.fn, args: expr.args.slice(-1)};
                 this.addTypeConstraint(fn, {kind: ExpressionKind.FN_TYPE, arg: argSymbol, inputType, outputType: type});
                 this.addTypeConstraint(expr.args[expr.args.length - 1], inputType);
@@ -301,7 +238,16 @@ export class ConstraintSolver {
                 return true;
             }
             case ExpressionKind.FN_TYPE: {
-                
+                const inputTypeLevel = symbolExpression(this.registry.createTempSymbol(false, LEVEL_TYPE), null);
+                const outputTypeLevel = symbolExpression(this.registry.createTempSymbol(false, LEVEL_TYPE), null);
+                this.addTypeConstraint(expr.inputType, {kind: ExpressionKind.UNIVERSE, subscript: inputTypeLevel});
+                let outputType = expr.outputType;
+                if (expr.arg !== void 0) {
+                    const arg = this.registry.createTempSymbol(true, expr.inputType);
+                    outputType = replaceOneSymbol(outputType, expr.arg, symbolExpression(arg, null));
+                }
+                this.addTypeConstraint(outputType, {kind: ExpressionKind.UNIVERSE, subscript: outputTypeLevel});
+                this.addEqualConstraint(type, {kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL_MAX, lhs: inputTypeLevel, rhs: outputTypeLevel}});
                 return true;
             }
             case ExpressionKind.PLACEHOLDER: return true;
@@ -311,7 +257,12 @@ export class ConstraintSolver {
                 return true;
             }
             case ExpressionKind.LEVEL:
+            case ExpressionKind.LEVEL_SUCC:
+            case ExpressionKind.LEVEL_MAX:
                 this.addEqualConstraint(type, LEVEL_TYPE);
+                return true;
+            case ExpressionKind.LEVEL_TYPE:
+                this.addEqualConstraint(type, {kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL, value: 0}});
                 return true;
             default: panic();
         }
@@ -326,7 +277,6 @@ export class ConstraintSolver {
                 const [expr2, changed2] = this.expand(con.smallerType);
                 return this.evaluateEqualConstraint(expr1, expr2) || changed1 || changed2;
             }
-            case ConstraintKind.SUBSCRIPT: return this.evaluateTypeUniverseSubscriptConstraint(con.smaller, con.larger, con.allowEqual);
             default: panic();
         }
     }
@@ -341,16 +291,17 @@ export class ConstraintSolver {
         }
         const tempReps = new Map<Symbol, Expression>();
         let hasUninferedVar = false;
+        const uninferedVars: Symbol[] = [];
         this.registry.forEachTempSymbol((s, entry) => {
             const ownValue = entry.ownValue;
             if (ownValue !== void 0) {
                 tempReps.set(s, this.expand(ownValue)[0]);
             } else if (!entry.isLocal) {
-                hasUninferedVar = true;
+                uninferedVars.push(s);
             }
         });
-        if (hasUninferedVar) {
-            this.diagnostics.push({kind: DiagnosticKind.UNINFERED_VAR});
+        if (uninferedVars.length > 0) {
+            this.diagnostics.push({kind: DiagnosticKind.UNINFERED_VAR, symbols: uninferedVars});
         }
         this.affectedSymbols.forEach(s => {
             const entry = this.registry.getSymbolEntry(s);
@@ -392,17 +343,6 @@ export class ConstraintSolver {
         for (const line of this.dump()) {
             this.logger.info(this.registry.parent, () => line);
         }
-        const constraints = this.constraints.slice(0);
-        this.constraints.length = 0;
-        const subscriptConstraints: UniverseSubscriptConstraint[] = [];
-        for (const con of constraints) {
-            if (con.kind === ConstraintKind.SUBSCRIPT) {
-                subscriptConstraints.push(con);
-            } else {
-                this.constraints.push(con);
-            }
-        }
-        // this.solveUniverseSubcriptConstraints(subscriptConstraints);
         this.finalCheck();
     }
     dump() {
@@ -432,9 +372,6 @@ export class ConstraintSolver {
     }
     addEqualConstraint(smallerType: Expression, largerType: Expression) {
         this.constraints.push({kind: ConstraintKind.EQUAL, smallerType, largerType});
-    }
-    addTypeUniverseSubscriptConstraint(smaller: Expression, larger: Expression, allowEqual: boolean) {
-        this.constraints.push({kind: ConstraintKind.SUBSCRIPT, smaller, larger, allowEqual});
     }
     run() {
         this.diagnostics.length = 0;

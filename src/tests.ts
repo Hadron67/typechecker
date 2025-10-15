@@ -27,4 +27,6 @@ function testParse(input: string) {
 
 testParse(`
 Nat.zero: Nat
+Nat.succ: Nat -> Nat
+Nat.ind: (n: builtin.Level) -> (C: Nat -> type(n)) -> C(Nat.zero) -> ((x: Nat) -> C(x) -> C(Nat.succ(x)))
 `);

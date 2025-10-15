@@ -193,7 +193,13 @@ export interface AstDeclaration {
     readonly lhs: Ast;
     readonly type?: Ast;
     readonly rhs?: Ast;
-};
+}
+
+export interface ExpressionDeclaration {
+    readonly lhs: Expression;
+    readonly type?: Expression;
+    readonly rhs?: Expression;
+}
 
 export interface AstFile {
     readonly declarations: AstDeclaration[];
@@ -904,6 +910,7 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
             prepareSymbol(decl.lhs);
         }
         if (diagnostics.length > 0) return exprs;
+        const decls: ExpressionDeclaration[] = [];
         for (const decl of file.declarations) {
             const lhsExpr = convertExpression(decl.lhs, null);
             if (lhsExpr === null) {
@@ -913,14 +920,17 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
             if (diagnostics.length > 0) return exprs;
 
             const rhsExpr = decl.rhs !== void 0 ? convertExpression(decl.rhs, collectAndCreatePatternSymbols(decl.lhs)) : null;
-            if (type !== null) {
+            decls.push({lhs: lhsExpr, rhs: rhsExpr ?? void 0, type: type ?? void 0});
+        }
+        for (const {lhs, rhs, type} of decls) {
+            if (type !== void 0) {
                 constraintSolver.addTypeTypeConstraint(type);
-                constraintSolver.addTypeConstraint(lhsExpr, type);
+                constraintSolver.addTypeConstraint(lhs, type);
             }
-            if (type === null && rhsExpr === null) {
+            if (type === void 0 && rhs === void 0) {
                 const tmp = symbolExpression(constraintSolver.registry.createTempSymbol(false, null), null);
                 constraintSolver.addTypeTypeConstraint(tmp);
-                constraintSolver.addTypeConstraint(lhsExpr, tmp);
+                constraintSolver.addTypeConstraint(lhs, tmp);
             }
         }
         return exprs;

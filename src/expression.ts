@@ -165,7 +165,9 @@ export class SymbolRegistry {
     defineInternalSymbols() {
         const builtin = this.addNewSymbol(null, "builtin", false)[0];
         const level = this.addNewSymbol(builtin, "Level", false)[0];
-        this.getSymbolEntry(level).ownValue = {kind: ExpressionKind.LEVEL_TYPE};
+        const levelEntry = this.getSymbolEntry(level);
+        levelEntry.ownValue = {kind: ExpressionKind.LEVEL_TYPE};
+        levelEntry.type = {kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL, value: 0}};
     }
     getSymbolCount() {
         return this.entriesById.length;
@@ -174,7 +176,12 @@ export class SymbolRegistry {
         return this.tryGetSymbolEntry(s) ?? panic();
     }
     getSymbolName(s: Symbol) {
-        return this.tryGetSymbolEntry(s) ?? `$${s - this.entriesById.length}`;
+        const entry = this.tryGetSymbolEntry(s);
+        if (entry !== null) {
+            return entry.name;
+        } else {
+            return `$${s - this.entriesById.length}`;
+        }
     }
     tryGetSymbolEntry(s: Symbol): SymbolEntry | null {
         if (s >= 0 && s < this.entriesById.length) {
@@ -283,6 +290,9 @@ export class TempSymbolRegistry {
         return s >= this.parent.getSymbolCount();
     }
     createTempSymbol(isLocal: boolean, type: Expression | null) {
+        if (this.tempSymbols.length === 12) {
+            debugger;
+        }
         const ret = this.tempSymbols.length + this.parent.getSymbolCount() as Symbol;
         const entry: SymbolEntry = { name: '', parent: null, isLocal };
         if (type !== null) {
@@ -545,8 +555,23 @@ export function visitExpression(expr: Expression, cb: (expr: Expression) => bool
                 if (cb(t)) return false;
                 todo.push(t.outputType, t.inputType);
                 break;
+            case ExpressionKind.LEVEL_SUCC:
+                if (cb(t)) return false;
+                todo.push(t.expr);
+                break;
+            case ExpressionKind.LEVEL_MAX:
+                if (cb(t)) return false;
+                todo.push(t.rhs, t.lhs);
+                break;
         }
     }
+    return true;
+}
+
+export function checkOwnValueCycle(lhs: Symbol, rhs: Expression) {
+    return visitExpression(rhs, expr => {
+        return expr.kind === ExpressionKind.SYMBOL && expr.symbol === lhs;
+    });
 }
 
 export function symbolExpression(symbol: Symbol, loc: FullSourceRange | null): SymbolExpression {
@@ -790,7 +815,7 @@ export function inputForm(context: SymbolRegistry, expr: DisplayExpression) {
                 todo.push(stack => {
                     const rhs = stack.pop()!;
                     const lhs = stack.pop()!;
-                    stack.push(`builting.Level.succ(${lhs}, ${rhs})`);
+                    stack.push(`builting.Level.max(${lhs}, ${rhs})`);
                 }, t.rhs, t.lhs);
                 break;
             }
