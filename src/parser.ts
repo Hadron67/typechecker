@@ -23,6 +23,7 @@ const CCODE_COMMA = ','.charCodeAt(0);
 const CCODE_EAR = '?'.charCodeAt(0);
 const CCODE_N = 'n'.charCodeAt(0);
 const CCODE_L = 'l'.charCodeAt(0);
+const CCODE_SEMI_COLON = ';'.charCodeAt(0);
 
 const CCODE_SPACE = ' '.charCodeAt(0);
 const CCODE_CR = '\r'.charCodeAt(0);
@@ -51,6 +52,7 @@ export const enum TokenKind {
     PROD,
     EAR,
     EQUIV,
+    SEMI_COLON,
 }
 
 const KEYWORKDS: {[name: string]: TokenKind} = {
@@ -326,6 +328,7 @@ export class Parser {
             case CCODE_COMMA: this.cursor++; return tk(TokenKind.COMMA);
             case CCODE_DOT: this.cursor++; return tk(TokenKind.DOT);
             case CCODE_EAR: this.cursor++; return tk(TokenKind.EAR);
+            case CCODE_SEMI_COLON: this.cursor++; return tk(TokenKind.SEMI_COLON);
             case CCODE_DASH:
                 this.cursor++;
                 if (this.source.charCodeAt(this.cursor) === CCODE_GT) {
@@ -565,6 +568,7 @@ export class Parser {
                     });
                     break;
                 }
+                default: self.unexpected(); break;
             }
         }
     }
@@ -591,6 +595,13 @@ export class Parser {
             }
             this.todo.pop()!(this);
         }
+    }
+    private parseOptionalSemicolon(): ParserTodo {
+        return self => {
+            if (self.token.kind === TokenKind.SEMI_COLON) {
+                self.doInOrder(self.nextToken(), self.parseOptionalSemicolon());
+            }
+        };
     }
     private parseFileItem(file: AstFile): ParserTodo {
         let type: Ast | undefined = void 0;
@@ -625,8 +636,9 @@ export class Parser {
                             file.assignments.push([lhs, rhs]);
                         });
                         break;
+                    default: file.declarations.push({lhs: self.astStack.pop()!, rhs, type, checkOnly: false});
                 }
-            });
+            }, self.parseOptionalSemicolon());
         };
     }
     private parseFile(file: AstFile): ParserTodo {

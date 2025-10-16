@@ -49,4 +49,20 @@ Nat.double: Nat -> Nat = Nat.ind(0l, \\x Nat, Nat.zero, \\x\\y Nat.succ(Nat.succ
 Nat.double(Nat.zero) :=== Nat.zero
 Nat.double(Nat.succ(Nat.zero)) :=== Nat.succ(Nat.succ(Nat.zero))
 Nat.double(Nat.succ(Nat.succ(Nat.zero))) :=== Nat.succ(Nat.succ(Nat.succ(Nat.succ(Nat.zero))))
-`, false);
+`, true);
+
+testOk(`
+Eq: (n: builtin.Level) -> (T: type(n)) -> T -> T -> type(n)
+Eq.refl: (n: builtin.Level) -> (T: type(n)) -> (x: T) -> Eq(n, T, x, x)
+Eq.ind: (n: builtin.Level) -> (T: type(n)) -> (C: (x: T) -> (y: T) -> Eq(n, T, x, y) -> type(n)) -> ((x: T) -> C(x, x, Eq.refl(n, T, x))) -> (x: T) -> (y: T) -> (p: Eq(n, T, x, y)) -> C(x, y, p)
+Eq.ind(?n, ?T, ?C, ?c0, ?x, ?x, Eq.refl(?n, ?T, ?x)) := c0(x)
+
+Eq.inv: (n: builtin.Level) -> (T: type(n)) -> (x: T) -> (y: T) -> Eq(n, T, x, y) -> Eq(n, T, y, x)
+    = \\n\\T\\x\\y\\p Eq.ind(n, T, \\x\\y\\p Eq(n, T, y, x), \\x Eq.refl(n, T, x), x, y, p);
+
+tmp.n: builtin.Level;
+tmp.T: type(tmp.n);
+tmp.x: tmp.T;
+
+Eq.inv(tmp.n, tmp.T, tmp.x, tmp.x, Eq.refl(tmp.n, tmp.T, tmp.x)) :=== Eq.refl(tmp.n, tmp.T, tmp.x)
+`, true);

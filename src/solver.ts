@@ -1,4 +1,4 @@
-import { Symbol, Expander, Expression, ExpressionKind, ExpressionLogger, ExpressionMessage, LEVEL_TYPE, symbolExpression, SymbolRegistry, TempSymbolRegistry, replaceOneSymbol, replaceSymbols, toPlainString, checkOwnValueCycle } from "./expression";
+import { Symbol, Expander, Expression, ExpressionKind, ExpressionLogger, ExpressionMessage, LEVEL_TYPE, symbolExpression, SymbolRegistry, TempSymbolRegistry, replaceOneSymbol, replaceSymbols, toPlainString, checkOwnValueCycle, CallExpression } from "./expression";
 import { assert, complement, panic } from "./util";
 
 export const enum DiagnosticKind {
@@ -134,7 +134,7 @@ export class ConstraintSolver {
     }
     private trySetOwnValue(symbol: Symbol, value: Expression) {
         const entry = this.registry.getSymbolEntry(symbol);
-        if (entry.ownValue !== void 0) return false;
+        if (entry.ownValue !== void 0 || entry.isLocal) return false;
         if (!this.registry.isTempSymbol(symbol)) return false;
         if (!checkOwnValueCycle(symbol, value)) {
             this.diagnostics.push({kind: DiagnosticKind.UNEQUAL, expr1: symbolExpression(symbol, null), expr2: value});
@@ -173,26 +173,25 @@ export class ConstraintSolver {
     private evaluateEqualConstraint(con: EqualConstraint, previouslyNoChange: boolean): boolean {
         let [expr1, changed1] = this.expand(con.expr1);
         let [expr2, changed2] = this.expand(con.expr2);
-        if (expr1.kind !== ExpressionKind.SYMBOL && expr2.kind === ExpressionKind.SYMBOL) {
-            const tmp = expr1;
-            expr1 = expr2;
-            expr2 = tmp;
-        }
-        if (expr1.kind === ExpressionKind.SYMBOL && expr2.kind === ExpressionKind.SYMBOL && !this.registry.isTempSymbol(expr1.symbol) && this.registry.isTempSymbol(expr2.symbol)) {
-            const tmp = expr1;
-            expr1 = expr2;
-            expr2 = tmp;
-        }
         if (expr1.kind === ExpressionKind.SYMBOL) {
-            if (expr2.kind === ExpressionKind.SYMBOL && expr1.symbol === expr2.symbol) return true;
-            if (this.trySetOwnValue(expr1.symbol, expr2)) return true;
+            if (expr2.kind === ExpressionKind.SYMBOL) {
+                if (expr1.symbol === expr2.symbol) return true;
+                if (this.trySetOwnValue(expr1.symbol, expr2)) return true;
+                if (this.trySetOwnValue(expr2.symbol, expr1)) return true;
+                this.diagnostics.push({kind: DiagnosticKind.UNEQUAL, expr1, expr2});
+                return true;
+            } else if (this.trySetOwnValue(expr1.symbol, expr2)) {
+                return true;
+            }
+        }
+        if (expr2.kind === ExpressionKind.SYMBOL && this.trySetOwnValue(expr2.symbol, expr1)) {
+            return true;
         }
         if (expr1.kind === ExpressionKind.LAMBDA && expr2.kind === ExpressionKind.LAMBDA) {
-            const arg1 = this.registry.createTempSymbol(true, null);
-            const arg2 = this.registry.createTempSymbol(true, null);
+            const arg = this.registry.createTempSymbol(true, null);
             this.addEqualConstraint(
-                replaceOneSymbol(expr1.body, expr1.arg, symbolExpression(arg1, null)),
-                replaceOneSymbol(expr2.body, expr2.arg, symbolExpression(arg2, null)),
+                replaceOneSymbol(expr1.body, expr1.arg, symbolExpression(arg, null)),
+                replaceOneSymbol(expr2.body, expr2.arg, symbolExpression(arg, null)),
             );
             return true;
         }
@@ -200,13 +199,14 @@ export class ConstraintSolver {
             this.addEqualConstraint(expr1.inputType, expr2.inputType);
             let output1 = expr1.outputType;
             let output2 = expr2.outputType;
-            if (expr1.arg !== void 0) {
+            if (expr1.arg !== void 0 || expr2.arg !== void 0) {
                 const arg = symbolExpression(this.registry.createTempSymbol(true, expr1.inputType), null);
-                output1 = replaceOneSymbol(output1, expr1.arg, arg);
-            }
-            if (expr2.arg !== void 0) {
-                const arg = symbolExpression(this.registry.createTempSymbol(true, expr2.inputType), null);
-                output2 = replaceOneSymbol(output2, expr2.arg, arg);
+                if (expr1.arg !== void 0) {
+                    output1 = replaceOneSymbol(output1, expr1.arg, arg);
+                }
+                if (expr2.arg !== void 0) {
+                    output2 = replaceOneSymbol(output2, expr2.arg, arg);
+                }
             }
             this.addEqualConstraint(output1, output2);
             return true;
@@ -226,16 +226,27 @@ export class ConstraintSolver {
         }
         if (this.matchLevelSucc(expr1, expr2)) return true;
 
-        if (previouslyNoChange && expr1.kind === ExpressionKind.CALL && expr2.kind === ExpressionKind.CALL) {
-            if (expr1.args.length !== expr2.args.length) {
-                this.diagnostics.push({kind: DiagnosticKind.UNEQUAL, expr1, expr2});
-                return false;
-            } else {
-                this.addEqualConstraint(expr1.fn, expr2.fn);
-                for (let i = 0, a = expr1.args, b = expr2.args; i < a.length; i++) {
-                    this.addEqualConstraint(a[i], b[i]);
+        if (expr1.kind === ExpressionKind.CALL && expr2.kind === ExpressionKind.CALL) {
+            const fn1 = expr1.fn;
+            const fn2 = expr2.fn;
+            assert(fn1.kind !== ExpressionKind.LAMBDA && fn2.kind !== ExpressionKind.LAMBDA);
+            if (fn1.kind === ExpressionKind.SYMBOL && fn2.kind === ExpressionKind.SYMBOL) {
+                const entry1 = this.registry.getSymbolEntry(fn1.symbol);
+                const entry2 = this.registry.getSymbolEntry(fn2.symbol);
+                const noDownValue1 = !this.registry.isTempSymbol(fn1.symbol) && (entry1.downValue === void 0 || entry1.downValue.length === 0);
+                const noDownValue2 = !this.registry.isTempSymbol(fn2.symbol) && (entry2.downValue === void 0 || entry2.downValue.length === 0);
+                if (previouslyNoChange || noDownValue1 && noDownValue2) {
+                    if (expr1.args.length !== expr2.args.length) {
+                        this.diagnostics.push({kind: DiagnosticKind.UNEQUAL, expr1, expr2});
+                        return false;
+                    } else {
+                        this.addEqualConstraint(expr1.fn, expr2.fn);
+                        for (let i = 0, a = expr1.args, b = expr2.args; i < a.length; i++) {
+                            this.addEqualConstraint(a[i], b[i]);
+                        }
+                        return true;
+                    }
                 }
-                return true;
             }
         }
 
@@ -258,41 +269,48 @@ export class ConstraintSolver {
                         case ConstraintKind.FN: this.addFnTypeEqualConstraint(symbolType, con.args, con.outputType); break;
                         default: panic();
                     }
+                    return true;
                 } else if (this.registry.isTempSymbol(expr.symbol) || this.unlockedSymbols.has(expr.symbol)) {
-                    this.affectedSymbols.add(expr.symbol);
                     if (con.kind === ConstraintKind.TYPE) {
+                        this.affectedSymbols.add(expr.symbol);
                         entry.type = con.type;
+                        if (entry.ownValue !== void 0) {
+                            this.addTypeConstraint(entry.ownValue, entry.type);
+                        }
+                        return true;
                     } else {
-                        entry.type = this.makeInferedFnType(con.args, con.outputType);
-                    }
-                    if (entry.ownValue !== void 0) {
-                        this.addTypeConstraint(entry.ownValue, entry.type);
+                        this.constraints.push(con);
+                        return false;
                     }
                 } else {
                     this.diagnostics.push({
                         kind: DiagnosticKind.UNTYPED_EXPRESSION,
                         expr,
                     });
+                    return true;
                 }
-                return true;
             }
             case ExpressionKind.CALL: {
                 if (con.kind === ConstraintKind.TYPE) {
                     this.addFnTypeConstraint(expr.fn, expr.args, con.type);
                 } else {
-                    this.addFnTypeConstraint(expr.fn, con.args.concat(expr.args), con.outputType);
+                    this.addFnTypeConstraint(expr.fn, expr.args.concat(con.args), con.outputType);
                 }
                 return true;
             }
             case ExpressionKind.LAMBDA: {
                 if (con.kind === ConstraintKind.TYPE) {
-                    const inputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
-                    const outputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
-                    const arg = this.registry.createTempSymbol(true, inputType);
-                    this.addTypeTypeConstraint(inputType);
-                    this.addTypeTypeConstraint(outputType);
-                    this.addTypeConstraint(replaceOneSymbol(expr.body, expr.arg, symbolExpression(arg, null)), outputType);
-                    this.addEqualConstraint({kind: ExpressionKind.FN_TYPE, arg, inputType, outputType}, con.type);
+                    // const outputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
+                    // const arg = this.registry.createTempSymbol(true, inputType);
+                    // this.addTypeTypeConstraint(inputType);
+                    // this.addTypeTypeConstraint(outputType);
+                    // this.addTypeConstraint(replaceOneSymbol(expr.body, expr.arg, symbolExpression(arg, null)), outputType);
+                    // this.addEqualConstraint({kind: ExpressionKind.FN_TYPE, arg, inputType, outputType}, con.type);
+                    const inputType = symbolExpression(this.createTypeSymbol(false), null);
+                    const outputType = symbolExpression(this.createTypeSymbol(false), null);
+                    const arg = symbolExpression(this.registry.createTempSymbol(true, inputType), null);
+                    this.addTypeConstraint(replaceOneSymbol(expr.body, expr.arg, arg), outputType);
+                    this.addFnTypeEqualConstraint(con.type, [arg], outputType);
                 } else if (con.args.length === 1) {
                     this.addTypeConstraint(replaceOneSymbol(expr.body, expr.arg, con.args[0]), con.outputType);
                 } else {
@@ -473,6 +491,9 @@ export class ConstraintSolver {
         const ret: ExpressionMessage[] = [];
         ret.push(['symbols:']);
         this.registry.forEachTempSymbol((s, entry) => {
+            if (entry.isLocal) {
+                ret.push(['    local ', symbolExpression(s, null)]);
+            }
             if (entry.type !== void 0) {
                 ret.push(['    ', {kind: ExpressionKind.TYPE_ASSERTION, type: entry.type, expr: symbolExpression(s, null)}]);
             }

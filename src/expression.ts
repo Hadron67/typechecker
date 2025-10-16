@@ -138,7 +138,7 @@ export interface DownValue {
 export interface SymbolEntry {
     readonly name: string;
     readonly parent: Symbol | null;
-    readonly isLocal: boolean;
+    readonly isLocal: boolean; // cannot assign own value, display as single name
     subSymbols?: Map<string, Symbol>;
     type?: Expression;
     // The terms `own value' and `down value' come from similar concepts in Mathematica
@@ -295,17 +295,18 @@ export class TempSymbolRegistry {
     }
 }
 
-export function matchPattern(expr: Expression, pattern: Expression, patternSymbols: Set<Symbol> | null) {
+export function matchPattern(expr0: Expression, pattern0: Expression, patternSymbols: Set<Symbol> | null) {
     const substitues: Map<Symbol, Expression> = new Map();
-    const todo: [Expression, Expression][] = [[pattern, expr]];
+    const todo: [Expression, Expression][] = [[pattern0, expr0]];
     while (todo.length > 0) {
         const [pattern, expr] = todo.pop()!;
         switch (pattern.kind) {
             case ExpressionKind.SYMBOL: {
                 if (patternSymbols !== null && patternSymbols.has(pattern.symbol)) {
                     const old = substitues.get(pattern.symbol);
-                    if (old !== void 0) {
-                        todo.push([old, expr]);
+                    // this recursive call will only occur once
+                    if (old !== void 0 && matchPattern(old, expr, null) === null) {
+                        return null;
                     } else {
                         substitues.set(pattern.symbol, expr);
                     }
@@ -638,6 +639,7 @@ class Replacer {
                         });
                     } else {
                         const old = self.maps.get(arg) ?? panic();
+                        self.maps.delete(arg);
                         self._doActions(self._replace(expr.body), self => {
                             self.maps.set(arg, old);
                             self.stack.push({kind: ExpressionKind.LAMBDA, arg, body: self.stack.pop()!});
