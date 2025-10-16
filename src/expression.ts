@@ -23,7 +23,6 @@ export type Expression =
     | CallExpression
     | FunctionTypeExpression
     | LambdaExpression
-    | PatternExpression
     | TypeUniverseExpression
     | LevelTypeExpression
     | PlaceholderExpression
@@ -37,7 +36,6 @@ export const enum ExpressionKind {
     LAMBDA,
     CALL,
     FN_TYPE,
-    PATTERN,
     PLACEHOLDER,
     UNIVERSE,
     LEVEL_TYPE,
@@ -73,11 +71,6 @@ export interface LambdaExpression {
     readonly kind: ExpressionKind.LAMBDA;
     readonly body: Expression;
     readonly arg: Symbol;
-}
-
-export interface PatternExpression {
-    readonly kind: ExpressionKind.PATTERN;
-    readonly variable?: Symbol;
 }
 
 export interface TypeUniverseExpression {
@@ -136,15 +129,10 @@ export type DisplayExpression =
 
 export const LEVEL_TYPE: LevelTypeExpression = {kind: ExpressionKind.LEVEL_TYPE};
 
-export interface ExpressionRule {
+export interface DownValue {
+    readonly patterns: Set<Symbol>;
     readonly lhs: Expression;
     readonly rhs: Expression;
-}
-
-export interface VariableInfo {
-    type?: Expression;
-    ownValue?: Expression;
-    readonly downValue: [Expression, Expression][];
 }
 
 export interface SymbolEntry {
@@ -153,8 +141,9 @@ export interface SymbolEntry {
     readonly isLocal: boolean;
     subSymbols?: Map<string, Symbol>;
     type?: Expression;
+    // The terms `own value' and `down value' come from similar concepts in Mathematica
     ownValue?: Expression;
-    downValue?: [Expression, Expression][];
+    downValue?: DownValue[];
 }
 
 export class SymbolRegistry {
@@ -264,8 +253,8 @@ export class SymbolRegistry {
                 lines.push(`${this.stringifySymbol(s)} = ${inputForm(this, ownValue)}`);
             }
             if (downValue !== void 0) {
-                for (const [lhs, rhs] of downValue) {
-                    lines.push(inputForm(this, lhs) + ' := ' + inputForm(this, rhs));
+                for (const d of downValue) {
+                    lines.push(inputForm(this, d.lhs) + ' := ' + inputForm(this, d.rhs));
                 }
             }
             if (entry.subSymbols) {
@@ -290,9 +279,6 @@ export class TempSymbolRegistry {
         return s >= this.parent.getSymbolCount();
     }
     createTempSymbol(isLocal: boolean, type: Expression | null) {
-        if (this.tempSymbols.length === 12) {
-            debugger;
-        }
         const ret = this.tempSymbols.length + this.parent.getSymbolCount() as Symbol;
         const entry: SymbolEntry = { name: '', parent: null, isLocal };
         if (type !== null) {
@@ -309,27 +295,26 @@ export class TempSymbolRegistry {
     }
 }
 
-export function matchPattern(expr: Expression, pattern: Expression) {
+export function matchPattern(expr: Expression, pattern: Expression, patternSymbols: Set<Symbol> | null) {
     const substitues: Map<Symbol, Expression> = new Map();
     const todo: [Expression, Expression][] = [[pattern, expr]];
     while (todo.length > 0) {
         const [pattern, expr] = todo.pop()!;
         switch (pattern.kind) {
             case ExpressionKind.SYMBOL: {
-                if (expr.kind !== ExpressionKind.SYMBOL) return null;
-                if (pattern.symbol !== expr.symbol) return null;
-                break;
-            }
-            case ExpressionKind.PATTERN:
-                if (pattern.variable !== void 0) {
-                    const old = substitues.get(pattern.variable);
+                if (patternSymbols !== null && patternSymbols.has(pattern.symbol)) {
+                    const old = substitues.get(pattern.symbol);
                     if (old !== void 0) {
                         todo.push([old, expr]);
                     } else {
-                        substitues.set(pattern.variable, expr);
+                        substitues.set(pattern.symbol, expr);
                     }
+                } else {
+                    if (expr.kind !== ExpressionKind.SYMBOL) return null;
+                    if (pattern.symbol !== expr.symbol) return null;
                 }
                 break;
+            }
             case ExpressionKind.CALL:
                 if (expr.kind !== ExpressionKind.CALL) return null;
                 if (expr.args.length !== pattern.args.length) {
@@ -407,6 +392,7 @@ export class Expander {
                     const entry = self.registry.getSymbolEntry(expr.symbol);
                     const ownValue = entry.ownValue;
                     if (ownValue !== void 0) {
+                        self.changed = true;
                         self.doActions(self._expand(ownValue));
                     } else self.stack.push(expr);
                     return;
@@ -418,11 +404,8 @@ export class Expander {
                 case ExpressionKind.LAMBDA: {
                     const arg = expr.arg;
                     self.doActions(self._expand(expr.body), self => {
-                        if (self.changed) {
-                            self.stack.push({kind: ExpressionKind.LAMBDA, arg, body: self.stack.pop()!});
-                        } else {
-                            self.stack.push(expr);
-                        }
+                        const body = self.stack.pop()!;
+                        self.stack.push({kind: ExpressionKind.LAMBDA, arg, body});
                     });
                     return;
                 }
@@ -466,7 +449,6 @@ export class Expander {
                     });
                     break;
                 }
-                case ExpressionKind.PATTERN:
                 case ExpressionKind.LEVEL_TYPE:
                 case ExpressionKind.LEVEL:
                 case ExpressionKind.PLACEHOLDER: self.stack.push(expr); return;
@@ -483,7 +465,7 @@ export class Expander {
                     let result: Expression;
                     switch (fn.kind) {
                         case ExpressionKind.LAMBDA: {
-                            result = replaceOneSymbol(fn, fn.arg, arg);
+                            result = replaceOneSymbol(fn.body, fn.arg, arg);
                             self.changed = true;
                             break;
                         }
@@ -496,11 +478,11 @@ export class Expander {
                     if (result.kind === ExpressionKind.CALL && result.fn.kind === ExpressionKind.SYMBOL) {
                         const entry = self.registry.getSymbolEntry(result.fn.symbol);
                         if (entry.downValue !== void 0) {
-                            for (const [lhs, rhs] of entry.downValue) {
-                                const map = matchPattern(result, lhs);
+                            for (const d of entry.downValue) {
+                                const map = matchPattern(result, d.lhs, d.patterns);
                                 if (map !== null) {
                                     self.changed = true;
-                                    result = replaceSymbols(rhs, map);
+                                    result = replaceSymbols(d.rhs, map);
                                     self.doActions(self._expand(result));
                                     return;
                                 }
@@ -511,8 +493,8 @@ export class Expander {
                 });
             } else {
                 const lastArg = args[args.length - 1];
-                self.doActions(self._expandCall(fn, args.slice(-1)), self => {
-                    self._expandCall(self.stack.pop()!, [lastArg]);
+                self.doActions(self._expandCall(fn, args.slice(0, -1)), self => {
+                    self.doActions(self._expandCall(self.stack.pop()!, [lastArg]));
                 });
             }
         };
@@ -536,7 +518,6 @@ export function visitExpression(expr: Expression, cb: (expr: Expression) => bool
             case ExpressionKind.LEVEL:
             case ExpressionKind.PLACEHOLDER:
             case ExpressionKind.LEVEL_TYPE:
-            case ExpressionKind.PATTERN:
             case ExpressionKind.SYMBOL: if (cb(t)) return false; break;
             case ExpressionKind.CALL:
                 if (cb(t)) return false;
@@ -775,21 +756,18 @@ export function inputForm(context: SymbolRegistry, expr: DisplayExpression) {
                 }, t.body);
                 break;
             }
-            case ExpressionKind.PATTERN: {
-                if (t.variable !== void 0) {
-                    stack.push(`?${context.getSymbolName(t.variable)}`);
-                } else {
-                    stack.push('?');
-                }
-                break;
-            }
             case ExpressionKind.CALL: {
                 const length = t.args.length;
+                const needsParenth = t.fn.kind !== ExpressionKind.SYMBOL && t.fn.kind !== ExpressionKind.CALL;
                 todo.push(stack => {
                     const args: string[] = [];
                     popReversed(stack, args, length);
                     const fn = stack.pop()!;
-                    stack.push(`${fn}(${args.join(', ')})`);
+                    if (!needsParenth) {
+                        stack.push(`${fn}(${args.join(', ')})`);
+                    } else {
+                        stack.push(`(${fn})(${args.join(', ')})`);
+                    }
                 });
                 pushReversed(todo, t.args);
                 todo.push(t.fn);
@@ -835,7 +813,10 @@ export interface ExpressionLogger {
 }
 
 export class ConsoleLogger implements ExpressionLogger {
+    enabled = true;
     info(context: SymbolRegistry, msg: () => ExpressionMessage): void {
-        console.log(toPlainString(context, msg()));
+        if (this.enabled) {
+            console.log(toPlainString(context, msg()));
+        }
     }
 }

@@ -1,4 +1,4 @@
-import { Expression, ExpressionKind, SymbolRegistry, Symbol, ConsoleLogger, symbolExpression } from "./expression";
+import { Expression, ExpressionKind, SymbolRegistry, Symbol, ConsoleLogger, symbolExpression, replaceSymbols, ExpressionLogger } from "./expression";
 import { ConstraintSolver, Diagnostic } from "./solver";
 import { assert, panic, popReversed, pushReversed } from "./util";
 
@@ -50,6 +50,7 @@ export const enum TokenKind {
     OPERATOR,
     PROD,
     EAR,
+    EQUIV,
 }
 
 const KEYWORKDS: {[name: string]: TokenKind} = {
@@ -176,7 +177,7 @@ export interface AstCall {
 
 export interface AstPattern extends SourceRange {
     readonly kind: AstKind.PATTERN;
-    readonly name?: AstIdentifier;
+    readonly name: AstIdentifier;
 }
 
 export interface AstTypeUniverse extends SourceRange {
@@ -193,12 +194,15 @@ export interface AstDeclaration {
     readonly lhs: Ast;
     readonly type?: Ast;
     readonly rhs?: Ast;
+    readonly checkOnly: boolean;
 }
 
 export interface ExpressionDeclaration {
+    readonly patterns: Set<Symbol>;
     readonly lhs: Expression;
     readonly type?: Expression;
     readonly rhs?: Expression;
+    readonly checkOnly: boolean;
 }
 
 export interface AstFile {
@@ -307,7 +311,14 @@ export class Parser {
         }
         switch (this.source.charCodeAt(this.cursor)) {
             case CCODE_COLON: this.cursor++; return tk(TokenKind.COLON);
-            case CCODE_EQUAL: this.cursor++; return tk(TokenKind.ASSIGN);
+            case CCODE_EQUAL:
+                this.cursor++;
+                if (this.cursor < this.source.length + 1 && this.source.charCodeAt(this.cursor) === CCODE_EQUAL && this.source.charCodeAt(this.cursor + 1) === CCODE_EQUAL) {
+                    this.cursor += 2;
+                    return tk(TokenKind.EQUIV);
+                } else {
+                    return tk(TokenKind.ASSIGN);
+                }
             case CCODE_OPEN_PARENTH: this.cursor++; return tk(TokenKind.OPEN_PARENTH);
             case CCODE_CLOSE_PARENTH: this.cursor++; return tk(TokenKind.CLOSE_PARENTH);
             case CCODE_OPEN_BRACKET: this.cursor++; return tk(TokenKind.OPEN_BRACKET);
@@ -547,13 +558,10 @@ export class Parser {
                 }
                 case TokenKind.EAR: {
                     const ear = asSourceRange(token);
-                    self.doInOrder(self.nextToken(), self => {
-                        if (self.token.kind === TokenKind.IDENTIFIER) {
-                            self.astStack.push({kind: AstKind.PATTERN, name: {kind: AstKind.IDENTIFIER, name: self.token.text, ...asSourceRange(self.token)}, ...ear});
-                            self.doInOrder(self.nextToken());
-                        } else {
-                            self.astStack.push({kind: AstKind.PATTERN, ...ear});
-                        }
+                    self.doInOrder(self.nextToken(), self.parseIdentifier(), self => {
+                        const name = self.astStack.pop()!;
+                        assert(name.kind === AstKind.IDENTIFIER);
+                        self.astStack.push({kind: AstKind.PATTERN, name, ...ear});
                     });
                     break;
                 }
@@ -587,25 +595,27 @@ export class Parser {
     private parseFileItem(file: AstFile): ParserTodo {
         let type: Ast | undefined = void 0;
         let rhs: Ast | undefined = void 0;
+        let checkOnly = false;
         return self => {
             self.doInOrder(self.parseExpression(), self => {
                 switch (self.token.kind) {
                     case TokenKind.COLON:
                         self.doInOrder(self.nextToken(), self => {
-                            if (self.token.kind !== TokenKind.ASSIGN) {
+                            if (self.token.kind !== TokenKind.ASSIGN && self.token.kind !== TokenKind.EQUIV) {
                                 self.doInOrder(self.parseExpression(), self => {
                                     type = self.astStack.pop()!;
                                 });
                             }
                         }, self => {
-                            if (self.token.kind === TokenKind.ASSIGN) {
+                            if (self.token.kind === TokenKind.ASSIGN || self.token.kind === TokenKind.EQUIV) {
+                                checkOnly = self.token.kind === TokenKind.EQUIV;
                                 self.doInOrder(self.nextToken(), self.parseExpression(), self => {
                                     rhs = self.astStack.pop()!;
                                 });
                             }
                         }, self => {
                             const lhs = self.astStack.pop() ?? panic();
-                            file.declarations.push({lhs, type, rhs});
+                            file.declarations.push({lhs, type, rhs, checkOnly});
                         });
                         break;
                     case TokenKind.ASSIGN:
@@ -645,25 +655,25 @@ interface Scope {
     readonly letVariables: Map<string, Symbol>;
 }
 
-export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: AstFile, fileId: FileId) {
+export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: AstFile, fileId: FileId, maxIterations: number, logger: ExpressionLogger) {
     const scopes: Scope[] = [{
         symbol: outermostSymbol,
         letVariables: new Map(),
     }];
     const diagnostics: ParseDiagnostic[] = [];
     const newSymbols: Set<Symbol> = new Set();
-    const constraintSolver = new ConstraintSolver(context, new ConsoleLogger());
+    const constraintSolver = new ConstraintSolver(context, logger);
 
     const generatedSymbol = context.getSymbol(null, "generated", true) ?? panic();
 
-    return run();
+    return run(maxIterations);
 
-    function run(): [ParseDiagnostic[], Diagnostic[]] {
+    function run(maxIterations: number): [ParseDiagnostic[], Diagnostic[]] {
         loadFile(file, fileId);
         if (diagnostics.length > 0) {
             newSymbols.forEach(s => context.removeSymbol(s));
         }
-        const d = constraintSolver.run();
+        const d = constraintSolver.run(maxIterations);
         if (d.length > 0) {
             newSymbols.forEach(s => context.removeSymbol(s));
         }
@@ -808,6 +818,14 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
                     todo.push(t.fn);
                     break;
                 }
+                case AstKind.PATTERN: {
+                    const symbol = getGeneratedSymbol(t.name.name);
+                    if (patternSymbols !== null) {
+                        patternSymbols.add(symbol);
+                    }
+                    stack.push({kind: ExpressionKind.SYMBOL, symbol, ...asSourceRange(t.name)});
+                    break;
+                }
                 case AstKind.EMPTY_SYMBOL: {
                     if (scopes.length > 0) {
                         stack.push({kind: ExpressionKind.SYMBOL, symbol: scopes[scopes.length - 1].symbol, ...asSourceRange(t)});
@@ -872,11 +890,11 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
                     break;
                 }
                 case AstKind.PATTERN: {
-                    if (t.name !== void 0) {
-                        stack.push({kind: ExpressionKind.PATTERN, variable: getGeneratedSymbol(t.name.name)});
-                    } else {
-                        stack.push({kind: ExpressionKind.PATTERN});
+                    const symbol = getGeneratedSymbol(t.name.name);
+                    if (patternSymbols !== null) {
+                        patternSymbols.add(symbol);
                     }
+                    stack.push({kind: ExpressionKind.SYMBOL, symbol, ...asSourceRange(t.name)});
                     break;
                 }
                 case AstKind.SYMBOL: {
@@ -904,6 +922,42 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
         return stack[0];
     }
 
+    function processOneDeclaration(decl: ExpressionDeclaration) {
+        let {lhs, rhs, type, patterns, checkOnly} = decl;
+        const reps = new Map<Symbol, Expression>();
+        patterns.forEach(symbol => {
+            reps.set(symbol, symbolExpression(constraintSolver.registry.createTempSymbol(true, null), null));
+        });
+        const lhsRep = replaceSymbols(lhs, reps);
+        const rhsRep = rhs !== void 0 ? replaceSymbols(rhs, reps) : void 0;
+        if (type !== void 0) {
+            constraintSolver.addTypeTypeConstraint(type);
+        } else {
+            type = symbolExpression(constraintSolver.createTypeSymbol(false), null);
+        }
+        constraintSolver.addTypeConstraint(lhsRep, type);
+
+        out: if (rhs !== void 0) {
+            if (!checkOnly && lhs.kind === ExpressionKind.SYMBOL) {
+                const entry = context.getSymbolEntry(lhs.symbol);
+                if (entry.ownValue === void 0) {
+                    entry.ownValue = rhs;
+                    break out;
+                }
+            }
+            if (rhsRep !== void 0) {
+                constraintSolver.addEqualConstraint(lhsRep, rhsRep);
+            }
+        }
+        if (!checkOnly && rhs !== void 0 && lhs.kind === ExpressionKind.CALL && lhs.fn.kind === ExpressionKind.SYMBOL && newSymbols.has(lhs.fn.symbol)) {
+            const entry = context.getSymbolEntry(lhs.fn.symbol);
+            if (entry.downValue === void 0) {
+                entry.downValue = [];
+            }
+            entry.downValue.push({lhs, rhs, patterns});
+        }
+    }
+
     function loadFile(file: AstFile, fileName: FileId) {
         const exprs: Expression[] = [];
         for (const decl of file.declarations) {
@@ -912,26 +966,19 @@ export function analyse(context: SymbolRegistry, outermostSymbol: Symbol, file: 
         if (diagnostics.length > 0) return exprs;
         const decls: ExpressionDeclaration[] = [];
         for (const decl of file.declarations) {
-            const lhsExpr = convertExpression(decl.lhs, null);
+            const patterns = new Set<Symbol>();
+            const lhsExpr = convertExpression(decl.lhs, patterns);
             if (lhsExpr === null) {
                 return exprs;
             }
             const type = decl.type !== void 0 ? convertExpression(decl.type, null) : null;
             if (diagnostics.length > 0) return exprs;
 
-            const rhsExpr = decl.rhs !== void 0 ? convertExpression(decl.rhs, collectAndCreatePatternSymbols(decl.lhs)) : null;
-            decls.push({lhs: lhsExpr, rhs: rhsExpr ?? void 0, type: type ?? void 0});
+            const rhsExpr = decl.rhs !== void 0 ? convertExpression(decl.rhs, patterns) : null;
+            decls.push({lhs: lhsExpr, rhs: rhsExpr ?? void 0, type: type ?? void 0, patterns, checkOnly: decl.checkOnly});
         }
-        for (const {lhs, rhs, type} of decls) {
-            if (type !== void 0) {
-                constraintSolver.addTypeTypeConstraint(type);
-                constraintSolver.addTypeConstraint(lhs, type);
-            }
-            if (type === void 0 && rhs === void 0) {
-                const tmp = symbolExpression(constraintSolver.registry.createTempSymbol(false, null), null);
-                constraintSolver.addTypeTypeConstraint(tmp);
-                constraintSolver.addTypeConstraint(lhs, tmp);
-            }
+        for (const decl of decls) {
+            processOneDeclaration(decl);
         }
         return exprs;
     }

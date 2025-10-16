@@ -1,5 +1,5 @@
 import { Symbol, Expander, Expression, ExpressionKind, ExpressionLogger, ExpressionMessage, LEVEL_TYPE, symbolExpression, SymbolRegistry, TempSymbolRegistry, replaceOneSymbol, replaceSymbols, toPlainString, checkOwnValueCycle } from "./expression";
-import { assert, panic } from "./util";
+import { assert, complement, panic } from "./util";
 
 export const enum DiagnosticKind {
     UNTYPED_EXPRESSION,
@@ -7,6 +7,7 @@ export const enum DiagnosticKind {
     UNMET_SUBSCRIPT_CONSTRAINT,
     UNRESOLVED_CONSTRAINT,
     UNINFERED_VAR,
+    FN_TYPE_EXPECTED,
 }
 
 export type Diagnostic =
@@ -15,6 +16,7 @@ export type Diagnostic =
     | DiagnosticUnmetUniverseSubscriptConstraint
     | DiagnosticUnresolvedConstraint
     | DiagnosticUninferedVar
+    | DiagnosticFnTypeExpected
 ;
 
 export interface DiagnosticUntypedExpression {
@@ -44,6 +46,11 @@ export interface DiagnosticUninferedVar {
     readonly symbols: Symbol[];
 }
 
+export interface DiagnosticFnTypeExpected {
+    readonly kind: DiagnosticKind.FN_TYPE_EXPECTED;
+    readonly type: Expression;
+}
+
 export function renderDiagnostic(diagnostic: Diagnostic): ExpressionMessage {
     switch (diagnostic.kind) {
         case DiagnosticKind.UNEQUAL: return ['uneqal expressions ', diagnostic.expr1, ' and ', diagnostic.expr2];
@@ -57,35 +64,58 @@ export function renderDiagnostic(diagnostic: Diagnostic): ExpressionMessage {
         case DiagnosticKind.UNMET_SUBSCRIPT_CONSTRAINT: return [`unmet subscript constraint: ${diagnostic.smaller} < ${diagnostic.larger}`];
         case DiagnosticKind.UNRESOLVED_CONSTRAINT: return ['unresolved constraint: ', ...dumpConstraint(diagnostic.constraint)];
         case DiagnosticKind.UNTYPED_EXPRESSION: return ['untyped expression ', diagnostic.expr];
+        case DiagnosticKind.FN_TYPE_EXPECTED: return ['function type expected: ', diagnostic.type];
     }
 }
 
 export const enum ConstraintKind {
+    FN,
     TYPE,
     EQUAL,
+    FN_TYPE_EQUAL,
 }
 
 export type Constraint =
-    | TypeConstraint
+    | NormalTypeConstraint
     | EqualConstraint
+    | FnTypeConstraint
+    | FnTypeEqualConstraint
     ;
 
-export interface TypeConstraint {
+export interface NormalTypeConstraint {
     readonly kind: ConstraintKind.TYPE;
     readonly expr: Expression;
     readonly type: Expression;
 }
 
+export interface FnTypeConstraint {
+    readonly kind: ConstraintKind.FN;
+    readonly expr: Expression;
+    readonly args: Expression[];
+    readonly outputType: Expression;
+}
+
+export type TypeConstraint = NormalTypeConstraint | FnTypeConstraint;
+
 export interface EqualConstraint {
     readonly kind: ConstraintKind.EQUAL;
-    readonly smallerType: Expression;
-    readonly largerType: Expression;
+    readonly expr1: Expression;
+    readonly expr2: Expression;
+}
+
+export interface FnTypeEqualConstraint {
+    readonly kind: ConstraintKind.FN_TYPE_EQUAL;
+    readonly fnType: Expression;
+    readonly args: Expression[];
+    readonly outputType: Expression;
 }
 
 export function dumpConstraint(con: Constraint): ExpressionMessage {
     switch (con.kind) {
         case ConstraintKind.TYPE: return [{kind: ExpressionKind.TYPE_ASSERTION, type: con.type, expr: con.expr}];
-        case ConstraintKind.EQUAL: return [{kind: ExpressionKind.EQUAL, lhs: con.smallerType, rhs: con.largerType}];
+        case ConstraintKind.EQUAL: return [{kind: ExpressionKind.EQUAL, lhs: con.expr1, rhs: con.expr2}];
+        case ConstraintKind.FN: return [{kind: ExpressionKind.TYPE_ASSERTION, expr: {kind: ExpressionKind.CALL, args: con.args, fn: con.expr}, type: con.outputType}];
+        case ConstraintKind.FN_TYPE_EQUAL: return [{kind: ExpressionKind.TYPE_ASSERTION, expr: {kind: ExpressionKind.CALL, args: con.args, fn: con.fnType}, type: con.outputType}];
     }
 }
 
@@ -105,7 +135,7 @@ export class ConstraintSolver {
     private trySetOwnValue(symbol: Symbol, value: Expression) {
         const entry = this.registry.getSymbolEntry(symbol);
         if (entry.ownValue !== void 0) return false;
-        if (!this.registry.isTempSymbol(symbol) && !this.unlockedSymbols.has(symbol)) return false;
+        if (!this.registry.isTempSymbol(symbol)) return false;
         if (!checkOwnValueCycle(symbol, value)) {
             this.diagnostics.push({kind: DiagnosticKind.UNEQUAL, expr1: symbolExpression(symbol, null), expr2: value});
             return false;
@@ -140,7 +170,9 @@ export class ConstraintSolver {
         }
         return false;
     }
-    private evaluateEqualConstraint(expr1: Expression, expr2: Expression): boolean {
+    private evaluateEqualConstraint(con: EqualConstraint, previouslyNoChange: boolean): boolean {
+        let [expr1, changed1] = this.expand(con.expr1);
+        let [expr2, changed2] = this.expand(con.expr2);
         if (expr1.kind !== ExpressionKind.SYMBOL && expr2.kind === ExpressionKind.SYMBOL) {
             const tmp = expr1;
             expr1 = expr2;
@@ -193,21 +225,48 @@ export class ConstraintSolver {
             return true;
         }
         if (this.matchLevelSucc(expr1, expr2)) return true;
-        this.addEqualConstraint(expr1, expr2);
-        return false;
+
+        if (previouslyNoChange && expr1.kind === ExpressionKind.CALL && expr2.kind === ExpressionKind.CALL) {
+            if (expr1.args.length !== expr2.args.length) {
+                this.diagnostics.push({kind: DiagnosticKind.UNEQUAL, expr1, expr2});
+                return false;
+            } else {
+                this.addEqualConstraint(expr1.fn, expr2.fn);
+                for (let i = 0, a = expr1.args, b = expr2.args; i < a.length; i++) {
+                    this.addEqualConstraint(a[i], b[i]);
+                }
+                return true;
+            }
+        }
+
+        if (changed1 || changed2) {
+            this.addEqualConstraint(expr1, expr2);
+        } else {
+            this.constraints.push(con);
+        }
+        return changed1 || changed2;
     }
-    private evaluateTypeConstraint(expr: Expression, type: Expression): boolean {
+    private evaluateTypeConstraint(con: TypeConstraint): boolean {
+        const expr = con.expr;
         switch (expr.kind) {
             case ExpressionKind.SYMBOL: {
                 const entry = this.registry.getSymbolEntry(expr.symbol);
                 const symbolType = entry.type;
                 if (symbolType !== void 0) {
-                    this.addEqualConstraint(symbolType, type);
+                    switch (con.kind) {
+                        case ConstraintKind.TYPE: this.addEqualConstraint(symbolType, con.type); break;
+                        case ConstraintKind.FN: this.addFnTypeEqualConstraint(symbolType, con.args, con.outputType); break;
+                        default: panic();
+                    }
                 } else if (this.registry.isTempSymbol(expr.symbol) || this.unlockedSymbols.has(expr.symbol)) {
                     this.affectedSymbols.add(expr.symbol);
-                    entry.type = type;
+                    if (con.kind === ConstraintKind.TYPE) {
+                        entry.type = con.type;
+                    } else {
+                        entry.type = this.makeInferedFnType(con.args, con.outputType);
+                    }
                     if (entry.ownValue !== void 0) {
-                        this.addTypeConstraint(entry.ownValue, type);
+                        this.addTypeConstraint(entry.ownValue, entry.type);
                     }
                 } else {
                     this.diagnostics.push({
@@ -218,23 +277,27 @@ export class ConstraintSolver {
                 return true;
             }
             case ExpressionKind.CALL: {
-                const inputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
-                this.addTypeTypeConstraint(inputType);
-                const argSymbol = this.registry.createTempSymbol(true, inputType);
-                const fn: Expression = expr.args.length === 1 ? expr.fn : {kind: ExpressionKind.CALL, fn: expr.fn, args: expr.args.slice(-1)};
-                this.addTypeConstraint(fn, {kind: ExpressionKind.FN_TYPE, arg: argSymbol, inputType, outputType: type});
-                this.addTypeConstraint(expr.args[expr.args.length - 1], inputType);
+                if (con.kind === ConstraintKind.TYPE) {
+                    this.addFnTypeConstraint(expr.fn, expr.args, con.type);
+                } else {
+                    this.addFnTypeConstraint(expr.fn, con.args.concat(expr.args), con.outputType);
+                }
                 return true;
             }
             case ExpressionKind.LAMBDA: {
-                const inputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
-                const outputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
-                const arg = this.registry.createTempSymbol(true, inputType);
-                this.addTypeTypeConstraint(inputType);
-                this.addTypeTypeConstraint(outputType);
-                this.addTypeConstraint(symbolExpression(arg, null), inputType);
-                this.addTypeConstraint(replaceOneSymbol(expr.body, expr.arg, symbolExpression(arg, null)), outputType);
-                this.addEqualConstraint({kind: ExpressionKind.FN_TYPE, arg, inputType, outputType}, type);
+                if (con.kind === ConstraintKind.TYPE) {
+                    const inputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
+                    const outputType = symbolExpression(this.registry.createTempSymbol(false, null), null);
+                    const arg = this.registry.createTempSymbol(true, inputType);
+                    this.addTypeTypeConstraint(inputType);
+                    this.addTypeTypeConstraint(outputType);
+                    this.addTypeConstraint(replaceOneSymbol(expr.body, expr.arg, symbolExpression(arg, null)), outputType);
+                    this.addEqualConstraint({kind: ExpressionKind.FN_TYPE, arg, inputType, outputType}, con.type);
+                } else if (con.args.length === 1) {
+                    this.addTypeConstraint(replaceOneSymbol(expr.body, expr.arg, con.args[0]), con.outputType);
+                } else {
+                    this.addFnTypeConstraint(replaceOneSymbol(expr.body, expr.arg, con.args[0]), con.args.slice(1), con.outputType);
+                }
                 return true;
             }
             case ExpressionKind.FN_TYPE: {
@@ -247,36 +310,84 @@ export class ConstraintSolver {
                     outputType = replaceOneSymbol(outputType, expr.arg, symbolExpression(arg, null));
                 }
                 this.addTypeConstraint(outputType, {kind: ExpressionKind.UNIVERSE, subscript: outputTypeLevel});
-                this.addEqualConstraint(type, {kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL_MAX, lhs: inputTypeLevel, rhs: outputTypeLevel}});
+                const type: Expression = {kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL_MAX, lhs: inputTypeLevel, rhs: outputTypeLevel}};
+                if (con.kind === ConstraintKind.TYPE) {
+                    this.addEqualConstraint(con.type, type);
+                } else {
+                    this.diagnostics.push({kind: DiagnosticKind.FN_TYPE_EXPECTED, type});
+                }
                 return true;
             }
             case ExpressionKind.PLACEHOLDER: return true;
             case ExpressionKind.UNIVERSE: {
-                const sub = this.registry.createTempSymbol(false, LEVEL_TYPE);
-                this.addEqualConstraint({kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL_SUCC, expr: symbolExpression(sub, null)}}, type);
+                const type: Expression = {kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL_SUCC, expr: expr.subscript}};
+                if (con.kind === ConstraintKind.TYPE) {
+                    this.addEqualConstraint(type, con.type);
+                } else {
+                    this.diagnostics.push({kind: DiagnosticKind.FN_TYPE_EXPECTED, type});
+                }
                 return true;
             }
             case ExpressionKind.LEVEL:
             case ExpressionKind.LEVEL_SUCC:
             case ExpressionKind.LEVEL_MAX:
-                this.addEqualConstraint(type, LEVEL_TYPE);
+                if (con.kind === ConstraintKind.TYPE) {
+                    this.addEqualConstraint(con.type, LEVEL_TYPE);
+                } else {
+                    this.diagnostics.push({kind: DiagnosticKind.FN_TYPE_EXPECTED, type: LEVEL_TYPE});
+                }
                 return true;
-            case ExpressionKind.LEVEL_TYPE:
-                this.addEqualConstraint(type, {kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL, value: 0}});
+            case ExpressionKind.LEVEL_TYPE: {
+                const type: Expression = {kind: ExpressionKind.UNIVERSE, subscript: {kind: ExpressionKind.LEVEL, value: 0}};
+                if (con.kind === ConstraintKind.TYPE) {
+                    this.addEqualConstraint(type, con.type);
+                } else {
+                    this.diagnostics.push({kind: DiagnosticKind.FN_TYPE_EXPECTED, type});
+                }
                 return true;
+            }
             default: panic();
         }
     }
-    private evaluateConstraint(con: Constraint) {
+    private makeInferedFnType(args: Expression[], outputType: Expression) {
+        let ret = outputType;
+        for (let i = 0; i < args.length; i++) {
+            const arg = args[args.length - 1 - i];
+            const sub = symbolExpression(this.registry.createTempSymbol(false, null), null);
+            const inputType = symbolExpression(this.registry.createTempSymbol(false, {kind: ExpressionKind.UNIVERSE, subscript: sub}), null);
+            this.addTypeConstraint(arg, inputType);
+            ret = {kind: ExpressionKind.FN_TYPE, inputType, outputType: ret };
+        }
+        return ret;
+    }
+    private evaluateFnTypeEqualConstraint(con: FnTypeEqualConstraint) {
+        const [fn, changed] = this.expand(con.fnType);
+        if (fn.kind === ExpressionKind.FN_TYPE) {
+            this.addTypeConstraint(con.args[0], fn.inputType);
+            let outputType = fn.outputType;
+            if (fn.arg !== void 0) {
+                outputType = replaceOneSymbol(outputType, fn.arg, con.args[0]);
+            }
+            if (con.args.length === 1) {
+                this.addEqualConstraint(con.outputType, outputType);
+            } else {
+                this.addFnTypeEqualConstraint(outputType, con.args.slice(1), con.outputType);
+            }
+            return true;
+        }
+        if (changed) {
+            this.addFnTypeEqualConstraint(con.fnType, con.args, con.outputType);
+        } else {
+            this.constraints.push(con);
+        }
+        return changed;
+    }
+    private evaluateConstraint(con: Constraint, previouslyNoChange: boolean) {
         switch (con.kind) {
-            case ConstraintKind.TYPE: {
-                return this.evaluateTypeConstraint(con.expr, con.type);
-            }
-            case ConstraintKind.EQUAL: {
-                const [expr1, changed1] = this.expand(con.largerType);
-                const [expr2, changed2] = this.expand(con.smallerType);
-                return this.evaluateEqualConstraint(expr1, expr2) || changed1 || changed2;
-            }
+            case ConstraintKind.FN:
+            case ConstraintKind.TYPE: return this.evaluateTypeConstraint(con);
+            case ConstraintKind.EQUAL: return this.evaluateEqualConstraint(con, previouslyNoChange);
+            case ConstraintKind.FN_TYPE_EQUAL: return this.evaluateFnTypeEqualConstraint(con);
             default: panic();
         }
     }
@@ -314,50 +425,66 @@ export class ConstraintSolver {
             if (entry.downValue !== void 0) {
                 for (let i = 0, a = entry.downValue; i < a.length; i++) {
                     const v = a[i];
-                    v[1] = replaceSymbols(v[1], tempReps);
+                    const reps = complement(tempReps, v.patterns);
+                    a[i] = {lhs: replaceSymbols(v.lhs, reps), rhs: replaceSymbols(v.rhs, reps), patterns: v.patterns};
                 }
             }
         });
     }
-    private iterate(maxIterations: number) {
-        let done = false;
-        let iterations = 0;
-        while (!done) {
-            if (iterations > maxIterations) {
-                break;
-            }
-            done = true;
-            this.logger.info(this.registry.parent, () => [`iteration ${iterations++}`]);
-            for (const line of this.dump()) {
-                this.logger.info(this.registry.parent, () => line);
-            }
-            const constraints = this.constraints.slice(0);
-            this.constraints.length = 0;
-            for (const con of constraints) {
-                if (this.evaluateConstraint(con)) {
-                    done = false;
-                }
-            }
-        }
-        this.logger.info(this.registry.parent, () => [`final state:`]);
+    private logDump(iterations: number) {
+        this.logger.info(this.registry.parent, () => [`iteration ${iterations++}`]);
         for (const line of this.dump()) {
             this.logger.info(this.registry.parent, () => line);
         }
+    }
+    private iterate(previouslyNoChange: boolean) {
+        let changed = false;
+        const constraints = this.constraints.slice(0);
+        this.constraints.length = 0;
+        for (const con of constraints) {
+            if (this.evaluateConstraint(con, previouslyNoChange)) {
+                changed = true;
+            }
+        }
+        return changed;
+    }
+    run(maxIterations: number) {
+        this.diagnostics.length = 0;
+        const date = new Date();
+        let done = false;
+        let iterations = 0;
+        while (!done) {
+            this.logDump(iterations);
+            if (iterations > maxIterations) {
+                break;
+            }
+            done = !this.iterate(false);
+            if (done) {
+                done = !this.iterate(true);
+            }
+        }
+        this.logDump(iterations);
+        const elapsed = new Date().valueOf() - date.valueOf();
+        this.logger.info(this.registry.parent, () => [`took ${elapsed}ms`]);
         this.finalCheck();
+        return this.diagnostics.slice(0);
     }
     dump() {
         const ret: ExpressionMessage[] = [];
+        ret.push(['symbols:']);
         this.registry.forEachTempSymbol((s, entry) => {
             if (entry.type !== void 0) {
-                ret.push([{kind: ExpressionKind.TYPE_ASSERTION, type: entry.type, expr: symbolExpression(s, null)}]);
+                ret.push(['    ', {kind: ExpressionKind.TYPE_ASSERTION, type: entry.type, expr: symbolExpression(s, null)}]);
             }
             if (entry.ownValue !== void 0) {
-                ret.push([{kind: ExpressionKind.EQUAL, lhs: symbolExpression(s, null), rhs: entry.ownValue}]);
+                ret.push(['    ', {kind: ExpressionKind.EQUAL, lhs: symbolExpression(s, null), rhs: entry.ownValue}]);
             }
         });
+        ret.push(['constraints:']);
         for (const con of this.constraints) {
-            ret.push(dumpConstraint(con));
+            ret.push(['    ', ...dumpConstraint(con)]);
         }
+        ret.push(['end'])
         return ret;
     }
     unlockSymbol(s: Symbol) {
@@ -367,15 +494,20 @@ export class ConstraintSolver {
         const sub = this.registry.createTempSymbol(false, LEVEL_TYPE);
         this.addTypeConstraint(type, {kind: ExpressionKind.UNIVERSE, subscript: symbolExpression(sub, null)});
     }
+    createTypeSymbol(isLocal: boolean) {
+        const level = this.registry.createTempSymbol(false, LEVEL_TYPE);
+        return this.registry.createTempSymbol(isLocal, {kind: ExpressionKind.UNIVERSE, subscript: symbolExpression(level, null)});
+    }
     addTypeConstraint(expr: Expression, type: Expression) {
         this.constraints.push({kind: ConstraintKind.TYPE, expr, type});
     }
     addEqualConstraint(smallerType: Expression, largerType: Expression) {
-        this.constraints.push({kind: ConstraintKind.EQUAL, smallerType, largerType});
+        this.constraints.push({kind: ConstraintKind.EQUAL, expr1: smallerType, expr2: largerType});
     }
-    run() {
-        this.diagnostics.length = 0;
-        this.iterate(100000);
-        return this.diagnostics.slice(0);
+    addFnTypeConstraint(expr: Expression, args: Expression[], outputType: Expression) {
+        this.constraints.push({kind: ConstraintKind.FN, expr, args, outputType});
+    }
+    addFnTypeEqualConstraint(fnType: Expression, args: Expression[], outputType: Expression) {
+        this.constraints.push({kind: ConstraintKind.FN_TYPE_EQUAL, fnType, args, outputType});
     }
 }

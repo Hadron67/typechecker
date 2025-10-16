@@ -26,3 +26,9 @@ export function copyMap<K, V>(map: Map<K, V>): Map<K, V> {
     map.forEach((k, v) => ret.set(v, k));
     return ret;
 }
+
+export function complement<K, V>(map: Map<K, V>, set: Set<K>) {
+    const ret = copyMap(map);
+    set.forEach(v => ret.delete(v));
+    return ret;
+}
